@@ -1,0 +1,7 @@
+# Extra dependencies only needed to run the Windows bridge components
+# (bridge/printer_status.py, bridge/server.py) — install these on the PC
+# next to the printer, on top of requirements.txt.
+paho-mqtt>=1.6
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.0

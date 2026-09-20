@@ -1,0 +1,7 @@
+# Core dependencies for model_analyzer, optimizer, profiles, and
+# bridge/job_history — everything that's implemented and tested in this
+# project so far. No printer, Bambu Studio, or network access needed to
+# use these.
+numpy>=1.26
+scipy>=1.11
+networkx>=3.0

@@ -1,0 +1,25 @@
+[project]
+name = "bambu-companion"
+version = "0.1.0"
+description = "Model analysis + print-setting optimization for a Bambu Lab A1 + AMS 2 Pro, built around Bambu Studio."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "networkx>=3.0",
+]
+
+[project.optional-dependencies]
+bridge = [
+    "paho-mqtt>=1.6",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["bambu_companion*"]
