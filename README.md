@@ -16,7 +16,7 @@ printer/Bambu Studio/OpenAI setup to finish.
 | Writing a project copy with changed settings | Tested by reading the copy back. **A written file has not yet been opened in Bambu Studio** |
 | Desktop GUI | Ran on Windows before 2026-10-07. Its full-profile export changed since (values now written in Bambu's own format) and `gui.py` has not been re-run |
 | **Claude connector** (local MCP server) | Tested by driving it as a real process over stdin/stdout with a test client. **Not yet run under Claude Desktop** — register it once (below) |
-| Printer + AMS status | Works idle; mid-print field names still unconfirmed |
+| Printer + AMS status | Working, idle and mid-print (confirmed during a live print 2026-10-08). Job state and AMS contents only arrive in the printer's full report, which the connector asks for on connecting (confirmed on the real printer 2026-10-08: the first check after a restart came back complete); until it arrives a check comes back marked incomplete |
 | **Headless slicing** | Rewritten to call Bambu Studio the documented way. **Not yet confirmed on a real install** — run the slice check (below) |
 | HTTP bridge for ChatGPT | Written; needs a live run. Its "approve" step still stops before slicing, on purpose, until the slice check passes |
 | Tunnel + ChatGPT connector | Not started |
@@ -154,8 +154,8 @@ Desktop starts it and talks to it over stdin/stdout — no network port,
 no tunnel, no API key, and nothing extra to `pip install` (printer
 status alone needs `paho-mqtt`, as before).
 
-What it is built not to do: start a print or send G-code (there is no
-code that publishes to the printer at all); change a saved preset
+What it is built not to do: start a print or send G-code (the only
+thing it ever sends the printer is a request to report its status); change a saved preset
 (preset folders are only read); replace an existing file (outputs are
 created exclusively — if the name is taken the write fails or the next
 free name is used); or handle the printer's address, serial or access
@@ -234,8 +234,8 @@ real:
   exported file (tested against a stand-in for Bambu Studio). Not yet
   confirmed against the real thing — that's what the slice check is for.
 - **`bridge/printer_status.py`** — real MQTT client for the printer's
-  local Developer Mode API. Topic names are a documented best guess (see
-  its docstring) that need confirming against your actual A1. Needs
+  local Developer Mode API. Topic and field names are confirmed against
+  the real A1, idle and mid-print (see its docstring). Needs
   `pip install paho-mqtt` and a printer with Developer Mode on.
 - **`bridge/server.py`** — the HTTP layer ChatGPT would call through a
   tunnel/relay (see the memory bank's "ChatGPT Connectivity" section).
@@ -294,9 +294,10 @@ docs/
    confirm the changed settings show up as "modified" on the preset —
    this path has been tested by reading the files back, not yet by
    opening one in the GUI.
-4. Capture printer status during an active print (the connector's
-   `printer_status` lists the field names it received) and reconcile
-   the unconfirmed mid-print fields in `printer_status.py`.
+4. ~~Capture printer status during an active print~~ — done
+   2026-10-08: the mid-print field names in `printer_status.py` are
+   confirmed. Still open: the shape of an `hms` (warning) entry, which
+   has been empty in every report so far.
 5. Once slicing is confirmed: wire `service.slice_model` into the HTTP
    bridge's approve endpoint, install `requirements-bridge.txt`, and
    bring up `bridge/server.py`.

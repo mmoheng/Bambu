@@ -213,8 +213,9 @@ TOOLS: list[dict[str, Any]] = [
     _tool(
         "printer_status",
         "Read-only printer and AMS status over the local network: what is loaded in each AMS "
-        "slot, temperatures, and print progress. Listens only — it cannot control the printer.",
-        {"wait_s": {"type": "number", "description": "Seconds to wait for the first report (default 8)."}},
+        "slot, temperatures, and print progress. It only asks the printer to report its status "
+        "— it cannot control the printer.",
+        {"wait_s": {"type": "number", "description": "Seconds to wait for the printer's full report (default 8)."}},
         read_only=True,
     ),
     _tool(

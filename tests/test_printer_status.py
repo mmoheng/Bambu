@@ -1,6 +1,11 @@
+import json
+import types
 import unittest
+from unittest import mock
 
+from bambu_companion.bridge import printer_status as ps
 from bambu_companion.bridge.printer_status import (
+    has_full_report,
     merge_report_delta,
     parse_report_payload,
     status_to_dict,
@@ -76,6 +81,23 @@ REAL_WIFI_ONLY_DELTA = {
     "sequence_id": "25890",
 }
 
+# The job fields of the full report the same A1 sent during a live print
+# on 2026-10-08. Names are exactly what it sent; the values are what the
+# connector parsed from them at the time (their raw types were not
+# captured, so the parser's int/float coercion is what is under test).
+REAL_MID_PRINT_FIELDS = {
+    "gcode_state": "RUNNING",
+    "subtask_name": "top_layer_finish_test",
+    "mc_percent": 13,
+    "layer_num": 0,
+    "total_layer_num": 8,
+    "mc_remaining_time": 39,
+    "nozzle_temper": 139.9375,
+    "bed_temper": 64.875,
+    "hms": [],
+    "command": "push_status",
+}
+
 
 class TestMergeReportDelta(unittest.TestCase):
     def test_second_delta_adds_new_top_level_field(self):
@@ -147,6 +169,36 @@ class TestParseReportPayloadAgainstRealShapes(unittest.TestCase):
         self.assertIsNone(status.bed_temp_c)
         self.assertEqual(status.ams_slots, [])
 
+    def test_mid_print_fields_parse_under_their_confirmed_names(self):
+        status = parse_report_payload(REAL_MID_PRINT_FIELDS)
+        self.assertEqual(status.print_name, "top_layer_finish_test")
+        self.assertEqual(status.progress_percent, 13.0)
+        self.assertEqual((status.current_layer, status.total_layers), (0, 8))
+        self.assertEqual(status.remaining_time_min, 39)
+        self.assertAlmostEqual(status.nozzle_temp_c, 139.9375)
+        self.assertEqual(status.warnings, [])
+
+
+class TestFullReport(unittest.TestCase):
+    def test_small_updates_alone_are_not_a_full_report(self):
+        state: dict = {}
+        for delta in (REAL_BED_TEMP_DELTA, REAL_WIFI_ONLY_DELTA):
+            state = merge_report_delta(state, delta)
+        status = parse_report_payload(state)
+        self.assertFalse(has_full_report(status))
+        self.assertFalse(status_to_dict(status)["complete"])
+
+    def test_stays_complete_once_the_full_report_has_arrived(self):
+        state = merge_report_delta({}, REAL_MID_PRINT_FIELDS)
+        state = merge_report_delta(state, REAL_BED_TEMP_DELTA)  # a later small update
+        data = status_to_dict(parse_report_payload(state))
+        self.assertTrue(data["complete"])
+        self.assertEqual(data["state"], "RUNNING")
+        self.assertNotIn("unconfirmed_fields", data)
+
+    def test_wrapped_payload_is_handled_the_same(self):
+        self.assertTrue(has_full_report(parse_report_payload({"print": {"gcode_state": "IDLE"}})))
+
 
 class TestStatusToDict(unittest.TestCase):
     def test_keeps_parsed_fields_and_drops_hardware_identifiers(self):
@@ -209,6 +261,62 @@ class TestPahoVersionCompatibility(unittest.TestCase):
         import types
 
         self.assertEqual(self._client_args(types.SimpleNamespace(Client=_FakePahoClient)), ())
+
+
+class _RecordingPahoClient(_FakePahoClient):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.subscribed: list[str] = []
+        self.published: list[tuple[str, str]] = []
+
+    def subscribe(self, topic):
+        self.subscribed.append(topic)
+
+    def publish(self, topic, payload):
+        self.published.append((topic, payload))
+
+
+class TestFullReportRequest(unittest.TestCase):
+    """The client asks for the printer's full report when it connects,
+    and that request is the only thing it ever sends the printer."""
+
+    def setUp(self):
+        with mock.patch.object(ps, "mqtt", types.SimpleNamespace(Client=_RecordingPahoClient)):
+            self.client = ps.PrinterStatusClient(host="h", serial="SERIAL", access_code="c", on_status=lambda s: None)
+        self.paho = self.client._client
+
+    def _connect(self, rc=0):
+        self.client._handle_connect(self.paho, None, {}, rc)
+
+    def test_connecting_subscribes_and_asks_for_the_full_report(self):
+        self._connect()
+        self.assertEqual(self.paho.subscribed, ["device/SERIAL/report"])
+        [(topic, payload)] = self.paho.published
+        self.assertEqual(topic, "device/SERIAL/request")
+        self.assertEqual(json.loads(payload), {"pushing": {"sequence_id": "0", "command": "pushall"}})
+
+    def test_reconnecting_soon_after_does_not_ask_again(self):
+        self._connect()
+        self._connect()
+        self.assertEqual(len(self.paho.subscribed), 2)  # the subscription is renewed
+        self.assertEqual(len(self.paho.published), 1)
+
+    def test_asks_again_once_the_minimum_interval_has_passed(self):
+        self._connect()
+        self.client._full_report_requested_at -= ps.FULL_REPORT_MIN_INTERVAL_S + 1
+        self._connect()
+        self.assertEqual(len(self.paho.published), 2)
+
+    def test_a_refused_connection_sends_nothing(self):
+        self._connect(rc=5)  # 5 = not authorised (wrong access code)
+        self.assertEqual(self.paho.published, [])
+        self._connect()  # and has not used up the one allowed request
+        self.assertEqual(len(self.paho.published), 1)
+
+    def test_incoming_reports_never_cause_anything_to_be_sent(self):
+        message = types.SimpleNamespace(payload=json.dumps({"print": REAL_BED_TEMP_DELTA}).encode())
+        self.client._handle_message(self.paho, None, message)
+        self.assertEqual(self.paho.published, [])
 
 
 if __name__ == "__main__":

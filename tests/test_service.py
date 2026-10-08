@@ -337,6 +337,7 @@ class FakePrinterClient:
             parse_report_payload(
                 {
                     "bed_temper": 24.5,
+                    "gcode_state": "IDLE",
                     "sn": "SECRET-SERIAL",
                     "ams": {"ams": [{"id": "0", "humidity": "1", "tray": [
                         {"id": "0", "tray_type": "PLA", "tray_color": "F7D959FF", "tray_uuid": "SECRET-UUID"},
@@ -672,6 +673,21 @@ class SilentPrinter(FakePrinterClient):
         pass  # connected, but the printer never reports
 
 
+class SmallUpdatesFirstPrinter(FakePrinterClient):
+    """What the real A1 did on 2026-10-08: temperature-only updates at
+    first, the full report (job state, AMS) some time later."""
+
+    def loop_start(self):
+        self.on_status(parse_report_payload({"bed_temper": 64.2, "nozzle_temper": 169.4}))
+
+    def send_full_report(self):
+        self.on_status(
+            parse_report_payload(
+                {"bed_temper": 64.9, "nozzle_temper": 139.9, "gcode_state": "RUNNING", "mc_percent": 13}
+            )
+        )
+
+
 class TestPrinterStatusFailures(ServiceCase):
     def setUp(self):
         super().setUp()
@@ -716,6 +732,29 @@ class TestPrinterStatusFailures(ServiceCase):
         self.assertFalse(status["connected"])
         self.assertIn("access code", status["message"])
         self.assertNotIn("192.168.1.50", repr(status))
+
+    def test_small_updates_alone_are_marked_incomplete_not_passed_off_as_idle(self):
+        service = CompanionService(printer_client_factory=SmallUpdatesFirstPrinter, printer_config_path=self.cfg)
+        self.addCleanup(service.close)
+        status = service.printer_status(wait_s=0.2)
+        self.assertTrue(status["connected"])
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["bed_temp_c"], 64.2)
+        self.assertIsNone(status["state"])
+        self.assertIn("may be missing", status["message"])
+
+    def test_waits_for_the_full_report_instead_of_returning_the_first_small_update(self):
+        service = CompanionService(printer_client_factory=SmallUpdatesFirstPrinter, printer_config_path=self.cfg)
+        self.addCleanup(service.close)
+        service.printer_status(wait_s=0)  # opens the connection; only a small update so far
+        timer = threading.Timer(0.3, FakePrinterClient.instances[0].send_full_report)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        status = service.printer_status(wait_s=5)
+        self.assertTrue(status["complete"])
+        self.assertEqual(status["state"], "RUNNING")
+        self.assertEqual(status["progress_percent"], 13.0)
+        self.assertNotIn("message", status)
 
     def test_old_data_is_shown_as_stale_not_live(self):
         service = CompanionService(printer_client_factory=FakePrinterClient, printer_config_path=self.cfg)

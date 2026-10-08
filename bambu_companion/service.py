@@ -17,9 +17,11 @@ What it will and won't do, per the project's Safety Rules:
   the name is taken), so nothing here replaces an existing file. It
   never edits a saved Bambu Studio preset, and only changes settings
   listed in `profiles/bambu_settings.py`.
-- Never: starts a print, sends G-code, or talks to the printer in any
-  way other than listening to its status reports. There is no code path
-  here that could.
+- Never: starts a print, sends G-code, or changes anything on the
+  printer. It listens to the printer's status reports, and the only
+  thing it ever sends is a request for a full one (see
+  `bridge/printer_status.py`). There is no code path here that could
+  do more.
 """
 
 from __future__ import annotations
@@ -792,9 +794,12 @@ class CompanionService:
     # ------------------------------------------------------------------
 
     def printer_status(self, wait_s: float | None = None) -> dict[str, Any]:
-        """Latest printer + AMS status. Listens only; never publishes.
+        """Latest printer + AMS status. Read-only: the one thing sent
+        to the printer is the client's request for its full report.
         The connection is opened on first use and kept, because the
         printer sends partial updates that only make sense accumulated.
+        Waits up to `wait_s` for the printer's full report; if it has
+        not arrived by then, what there is comes back marked incomplete.
         """
         from .bridge import printer_status as ps  # local: optional paho dependency
 
@@ -840,8 +845,9 @@ class CompanionService:
         deadline = time.monotonic() + wait_s
         while time.monotonic() < deadline:
             with self._lock:
-                if self._printer["latest"] is not None:
-                    break
+                latest = self._printer["latest"]
+            if latest is not None and ps.has_full_report(latest):
+                break
             time.sleep(0.1)
 
         with self._lock:
@@ -859,6 +865,13 @@ class CompanionService:
         result = ps.status_to_dict(latest)
         age = time.monotonic() - updated if updated else None
         result["seconds_since_last_update"] = round(age, 1) if age is not None else None
+        if not result["complete"]:
+            result["message"] = (
+                "The printer was asked for its full report but only small updates "
+                "(temperatures, fans) have arrived so far, so job state, progress and AMS "
+                "contents may be missing — that does not mean the printer is idle. Check again "
+                "in a minute."
+            )
         if age is not None and age > PRINTER_STALE_AFTER_S:
             # The printer reports every few seconds while it is on. Old
             # data is shown, but not as a live connection.

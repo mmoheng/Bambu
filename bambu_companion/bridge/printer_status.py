@@ -25,27 +25,43 @@ internally — calling it directly with a single raw delta message will
 under-report almost everything, by design of the real protocol, not a
 bug in this code.
 
-STILL UNCONFIRMED: `nozzle_temper`, `gcode_state`, `mc_percent`,
-`layer_num`, `total_layer_num`, `subtask_name`, `mc_remaining_time`,
-`hms` — none of these appeared in the idle-printer capture. They may
-only be pushed during an active print, or may use different field
-names entirely; the field-path guesses for these in
-`parse_report_payload` remain UNVERIFIED. Re-capture (see
-`bridge/README.md`) during an actual print job to confirm/fix them
-before trusting progress/temperature reporting during a real print.
+CONFIRMED 2026-10-08 during a live print on the same A1 (through the
+connector's `printer_status`, which reports the field names it
+received): `nozzle_temper`, `gcode_state`, `mc_percent`, `layer_num`,
+`total_layer_num`, `subtask_name`, `gcode_file` and `mc_remaining_time`
+all arrive under exactly these names, and parsed to the job that was
+really running (state RUNNING, its name, percent, layers, minutes left).
+
+Also seen that day: those fields come only in the printer's FULL
+report. The small in-between updates carry temperatures, fans and wifi
+and nothing else, and left alone the printer sends the full report
+only on its own schedule — two checks half a minute after connecting
+had neither job state nor AMS contents; one a couple of minutes later
+had everything. So the client now asks for it once on connecting (a
+`pushall` request, see `FULL_REPORT_REQUEST`), and `has_full_report`
+says whether it has arrived. CONFIRMED the same day on the real A1:
+with the request in place, the first check after a connector restart
+came back complete (job state and AMS contents) inside the default
+8-second wait.
+
+STILL UNCONFIRMED: the shape of an `hms` (warning) entry. The field
+arrives under that name, but it was empty in every report seen so far.
 
 This module requires `paho-mqtt` (`pip install paho-mqtt`) on the
 machine running the bridge.
 
 V1 is read-only: this module never publishes a command that changes
-printer state (no start/pause/stop/temperature-override). See the
-project's Safety Rules.
+printer state (no start/pause/stop/temperature-override). The single
+message it does publish, `FULL_REPORT_REQUEST`, only asks the printer
+to report its status (the owner asked for this on 2026-10-08; until
+then the module published nothing). See the project's Safety Rules.
 """
 
 from __future__ import annotations
 
 import json
 import ssl
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -66,7 +82,17 @@ class Topics:
     """
 
     REPORT = "device/{serial}/report"  # printer publishes status here
-    REQUEST = "device/{serial}/request"  # read-only client should NOT publish here in V1
+    REQUEST = "device/{serial}/request"  # only FULL_REPORT_REQUEST is ever published here
+
+
+# The one message this module publishes: it asks the printer to send its
+# full status report, and changes nothing on the printer.
+FULL_REPORT_REQUEST = {"pushing": {"sequence_id": "0", "command": "pushall"}}
+# The community protocol notes (OpenBambuAPI) advise not sending pushall
+# more often than every 5 minutes on the P1-class boards, which lag
+# under it. A reconnect loop (see PrinterStatusClient's NOTE) must not
+# turn into a stream of requests.
+FULL_REPORT_MIN_INTERVAL_S = 300.0
 
 
 @dataclass(frozen=True)
@@ -120,12 +146,9 @@ def merge_report_delta(state: dict[str, Any], delta: dict[str, Any]) -> dict[str
 def parse_report_payload(payload: dict[str, Any]) -> PrinterStatus:
     """Pure parser: dict in, PrinterStatus out. Kept separate from the
     MQTT plumbing so it's unit-testable with a synthetic payload — no
-    printer or network required. Field paths below are a best-effort
-    guess at the report shape based on common community-client fields
-    (`gcode_state`, `mc_percent`, `layer_num`, `total_layer_num`,
-    `nozzle_temper`, `bed_temper`, `ams`); confirm/adjust field names
-    against a captured real payload from your printer (see module
-    docstring) before trusting this in production.
+    printer or network required. The field names below are confirmed
+    against a real A1, idle and mid-print (see module docstring); only
+    the shape of an `hms` entry is still a guess.
     """
     print_data = payload.get("print", payload)
 
@@ -161,6 +184,19 @@ def parse_report_payload(payload: dict[str, Any]) -> PrinterStatus:
     )
 
 
+# Only the printer's full report carries the job state; the small
+# in-between updates (temperatures, fans, wifi) never do.
+FULL_REPORT_FIELD = "gcode_state"
+
+
+def has_full_report(status: PrinterStatus) -> bool:
+    """Whether the accumulated state includes a full report yet. Until
+    it does, job state, progress and AMS contents may simply be missing
+    (see module docstring) — that is not the same as an idle printer."""
+    print_data = status.raw.get("print", status.raw) if isinstance(status.raw, dict) else {}
+    return FULL_REPORT_FIELD in print_data
+
+
 def status_to_dict(status: PrinterStatus) -> dict[str, Any]:
     """PrinterStatus as plain JSON-friendly data for a caller outside
     this PC (the connector, the HTTP bridge).
@@ -168,9 +204,10 @@ def status_to_dict(status: PrinterStatus) -> dict[str, Any]:
     Deliberately leaves out `raw` — the accumulated MQTT state carries
     hardware identifiers (serial, tray UUIDs, chip IDs) that have no
     business leaving the machine. `fields_received` lists only the
-    *names* of the top-level fields seen so far: enough to tell whether
-    the still-unconfirmed mid-print fields (see module docstring) are
-    arriving under the names this parser expects, without the values.
+    *names* of the top-level fields seen so far, without the values:
+    enough to check the parser against what the printer really sends.
+    `complete` is False until a full report has arrived (see
+    `has_full_report`).
     """
     print_data = status.raw.get("print", status.raw) if isinstance(status.raw, dict) else {}
     return {
@@ -194,10 +231,7 @@ def status_to_dict(status: PrinterStatus) -> dict[str, Any]:
             for s in status.ams_slots
         ],
         "fields_received": sorted(str(k) for k in print_data),
-        "unconfirmed_fields": (
-            "state, progress, layers, remaining time and nozzle temperature use field names "
-            "that have not yet been confirmed against this printer during a print"
-        ),
+        "complete": has_full_report(status),
     }
 
 
@@ -220,8 +254,9 @@ class PrinterStatusClient:
     each incoming delta into a running state dict (see `merge_report_delta`
     — confirmed necessary against a real printer, whose push_status
     messages are partial, not full snapshots), and hands the resulting
-    PrinterStatus to `on_status`. Never publishes anything (V1 read-only
-    scope).
+    PrinterStatus to `on_status`. On connecting it asks the printer for
+    its full report (`FULL_REPORT_REQUEST`); it publishes nothing else
+    (V1 read-only scope).
 
     Usage (on the bridge machine, with paho-mqtt installed):
 
@@ -257,6 +292,7 @@ class PrinterStatusClient:
         self.access_code = access_code
         self.on_status = on_status
         self._state: dict[str, Any] = {}
+        self._full_report_requested_at: Optional[float] = None
         # paho-mqtt 2.x made the callback API version an explicit
         # argument; the callbacks below use the 1.x signatures, which
         # VERSION1 keeps. paho-mqtt 1.x has no such argument.
@@ -307,6 +343,16 @@ class PrinterStatusClient:
 
     def _handle_connect(self, client, userdata, flags, rc):  # noqa: ANN001 - paho callback signature
         client.subscribe(Topics.REPORT.format(serial=self.serial))
+        if rc == 0:  # connection accepted
+            self._request_full_report(client)
+
+    def _request_full_report(self, client) -> None:  # noqa: ANN001 - paho client
+        now = time.monotonic()
+        last = self._full_report_requested_at
+        if last is not None and now - last < FULL_REPORT_MIN_INTERVAL_S:
+            return
+        self._full_report_requested_at = now
+        client.publish(Topics.REQUEST.format(serial=self.serial), json.dumps(FULL_REPORT_REQUEST))
 
     def _handle_message(self, client, userdata, msg):  # noqa: ANN001 - paho callback signature
         try:
