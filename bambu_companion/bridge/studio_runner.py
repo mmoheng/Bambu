@@ -10,21 +10,42 @@ installed (your Windows PC) — running it here would just fail with
 
 IMPORTANT — read before trusting this against a real print:
 The CLI flags below (`--slice`, `--load-settings`, `--load-filaments`,
-`--export-3mf`, etc.) come from Bambu Studio's own GitHub wiki
-(bambulab/BambuStudio, "Command Line Usage") as of this project's design
-review (2026-09-20), but that page is informal/community-maintained and
-the exact flag set can drift between Bambu Studio versions. Before
-depending on this: run `<bambu-studio-exe> --help` on your installed
-version and reconcile against `_KNOWN_FLAGS` below.
+`--export-3mf`, etc.) were confirmed for real on 2026-09-20 against
+BambuStudio-02.08.03.66 (`--help` output captured directly from that
+install) — `_KNOWN_FLAGS` matches this build. Re-check against your own
+`<bambu-studio-exe> --help` if you're on a different version, since this
+is a fast-moving fork and flags do change between releases.
 
-There's also a known, reported CLI reliability gap: `--load-settings` /
-`--load-filaments` have been observed to silently fall back to defaults
-instead of erroring (see the project's Research Findings). That's why
-`run_slice_job` always runs `verify_settings_applied()` against the
-exported 3MF afterward instead of trusting a zero exit code — per the
-memory bank's Failure Behavior: "CLI silently ignored settings: verify
-recommended settings actually landed in the exported 3MF/gcode metadata
-before reporting success."
+UNRESOLVED as of 2026-09-20 — headless slicing currently fails on this
+same real install: every attempt (`--slice 0 --export-3mf ...`, with and
+without `--orient 1 --arrange 1`, against both a raw STL and a
+GUI-saved `.3mf` project with the object already placed) errors with:
+
+    plate 1: Nothing to be sliced, Either the print is empty or no
+    object is fully inside the print volume before apply.
+
+even though the tested model (94x79x106mm) is comfortably within the
+A1's build volume. This matches a known, closed upstream issue
+(bambulab/BambuStudio#5041) whose resolution we could not read (GitHub
+blocked the comment thread from this dev environment). NOT YET FIXED —
+`run_slice_job` should not be trusted to actually produce output until
+this is root-caused for real (it does correctly raise `StudioRunnerError`
+rather than report false success when this happens, per the project's
+Failure Behavior rule, but "correctly fails" isn't "works"). Leading
+theory, untested: none of our attempts included `--load-settings`/
+`--load-filaments` — every one of Bambu's own documented *working*
+CLI examples does include a real process/filament/machine profile, so
+the missing profile may be exactly what's needed. See
+`bridge/README.md`'s status table for the fuller writeup and next steps.
+
+There's also a known, reported CLI reliability gap unrelated to the
+above: `--load-settings` / `--load-filaments` have been observed to
+silently fall back to defaults instead of erroring (see the project's
+Research Findings). That's why `run_slice_job` always runs
+`verify_settings_applied()` against the exported 3MF afterward instead
+of trusting a zero exit code — per the memory bank's Failure Behavior:
+"CLI silently ignored settings: verify recommended settings actually
+landed in the exported 3MF/gcode metadata before reporting success."
 """
 
 from __future__ import annotations
@@ -64,8 +85,14 @@ class SliceJobSpec:
 
 def find_bambu_studio_executable(explicit_path: str | None = None) -> Path:
     """Locates the Bambu Studio executable. Pass `explicit_path` (e.g.
-    from a config file) to skip auto-detection entirely — recommended,
-    since install locations vary by version/install method.
+    from a config file) to skip auto-detection entirely — STRONGLY
+    recommended in practice, not just as a nicety: confirmed on a real
+    machine (2026-09-20) that Bambu Studio is often installed somewhere
+    that doesn't match either default candidate below at all (that
+    machine had it at `G:\\Bambu Studio\\bambu-studio.exe` — a different
+    drive letter and no "Program Files"), so auto-detection failing is
+    the common case, not the exception. Always pass the real path if you
+    have it.
 
     Auto-detection only checks the conventional Windows install path;
     it deliberately does NOT search the whole filesystem. If it can't

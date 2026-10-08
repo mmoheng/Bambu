@@ -15,31 +15,46 @@ mostly be "does FastAPI serve this correctly", not "is the underlying
 logic right".
 
 Endpoints map directly to the memory bank's V1 feature list:
-- GET  /printer/status         -> read-only printer/AMS status
-- POST /model/analyze           -> run the model analyzer on an uploaded file
-- POST /optimize                -> get setting recommendations for a goal
+- GET  /health                   -> unauthenticated liveness check
+- GET  /printer/status           -> read-only printer/AMS status
+- POST /model/analyze            -> run the model analyzer on an uploaded file
+- POST /optimize                 -> get setting recommendations for a goal
 - POST /jobs/{job_id}/approve    -> apply approved changes to a temp profile + slice
-- GET  /jobs                    -> job history
+- GET  /jobs                     -> job history
 
 No endpoint here starts a print, sends G-code, or changes firmware/safety
 settings — see Safety Rules. Every mutating endpoint (approve) requires
 an explicit approved-keys list from the caller; nothing is auto-applied.
+
+AUTH: every endpoint except /health requires an `X-API-Key` header
+matching the key `api_auth.get_or_create_api_key()` generates on first
+run (see that module) — this is what actually controls who can use this
+server once it's reachable from the internet through a tunnel; the
+tunnel itself is not an access-control boundary.
+
+RUNNING IT: `python -m bambu_companion.bridge.server` starts it on
+127.0.0.1:8420 (loopback only — a Cloudflare Tunnel or similar is what
+should expose it beyond your own PC, not binding to 0.0.0.0) and prints
+the API key you'll paste into your Custom GPT's Action auth config.
 """
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from ..model_analyzer import analyze
 from ..optimizer import optimize, to_dict
 from ..profiles.temp_profile import ApprovalError, apply_changes
 from ..schemas import PrintContext, PrintGoal
+from .api_auth import get_or_create_api_key, matches
 from .job_history import JobHistoryStore, JobRecord, new_job_id, now_iso
-from .printer_status import PrinterStatusClient
+from .printer_config import load_printer_config
+from .printer_status import PrinterConnectionError, PrinterStatus, PrinterStatusClient
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import Depends, FastAPI, Header, HTTPException
     from pydantic import BaseModel
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
@@ -66,24 +81,88 @@ class ApproveRequest(BaseModel):
     approved_keys: list[str]
 
 
-def create_app(history_path: str | Path = "job_history.json") -> "FastAPI":
-    app = FastAPI(title="Bambu Companion Bridge")
+def create_app(
+    history_path: str | Path = "job_history.json",
+    api_key: Optional[str] = None,
+    printer_config_path: Optional[Path] = None,
+) -> "FastAPI":
+    api_key = api_key or get_or_create_api_key()
+
+    def _verify_api_key(x_api_key: str = Header(default="")) -> None:
+        if not matches(x_api_key, api_key):
+            raise HTTPException(
+                status_code=401,
+                detail="Missing or invalid X-API-Key header.",
+            )
+
+    require_key = Depends(_verify_api_key)
+
     history = JobHistoryStore(history_path)
     # Populated by /optimize, consumed by /jobs/{id}/approve — an in-memory
     # cache of proposals awaiting approval within this process's lifetime.
     pending_proposals: dict[str, dict[str, Any]] = {}
 
-    @app.get("/printer/status")
-    def printer_status():
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                "Not wired up yet — requires printer host/serial/access-code config and a "
-                "live Developer Mode connection. See bridge/printer_status.py."
-            ),
-        )
+    # Background MQTT connection to the printer, started once on app
+    # startup and kept running for the life of the process — a fresh
+    # per-request connection would be slow and fragile, and Bambu's
+    # push_status messages are partial deltas (see printer_status.py)
+    # that only make sense accumulated over time, not read once.
+    printer_state: dict[str, Any] = {"client": None, "latest": None, "error": None}
 
-    @app.post("/model/analyze")
+    def _on_printer_status(status: PrinterStatus) -> None:
+        printer_state["latest"] = status
+
+    @asynccontextmanager
+    async def _lifespan(_app: "FastAPI") -> AsyncIterator[None]:
+        # Startup (runs once, before the app accepts requests).
+        cfg = load_printer_config(printer_config_path)
+        if not (cfg["host"] and cfg["serial"] and cfg["access_code"]):
+            printer_state["error"] = (
+                "No printer configured yet — connect once from the desktop GUI (or run "
+                "the MQTT setup) so host/serial/access code get saved locally, then "
+                "restart the bridge."
+            )
+        else:
+            try:
+                client = PrinterStatusClient(
+                    host=cfg["host"],
+                    serial=cfg["serial"],
+                    access_code=cfg["access_code"],
+                    on_status=_on_printer_status,
+                )
+                client.connect()
+                client.loop_start()
+                printer_state["client"] = client
+            except PrinterConnectionError as exc:
+                printer_state["error"] = str(exc)
+
+        yield  # server runs here
+
+        # Shutdown (runs once, after the app stops accepting requests).
+        client = printer_state.get("client")
+        if client is not None:
+            client.disconnect()
+
+    app = FastAPI(title="Bambu Companion Bridge", lifespan=_lifespan)
+
+    @app.get("/health")
+    def health():
+        # Deliberately unauthenticated — a quick way to confirm the
+        # server + tunnel are up without needing the API key on hand.
+        return {"status": "ok", "service": "bambu-companion-bridge"}
+
+    @app.get("/printer/status", dependencies=[require_key])
+    def printer_status():
+        latest = printer_state.get("latest")
+        if latest is None:
+            raise HTTPException(
+                status_code=503,
+                detail=printer_state.get("error")
+                or "Connected, but no status received yet — give it a few seconds.",
+            )
+        return _printer_status_to_dict(latest)
+
+    @app.post("/model/analyze", dependencies=[require_key])
     def model_analyze(req: AnalyzeRequest):
         try:
             result = analyze(req.model_path)
@@ -91,7 +170,7 @@ def create_app(history_path: str | Path = "job_history.json") -> "FastAPI":
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return _analysis_to_dict(result)
 
-    @app.post("/optimize")
+    @app.post("/optimize", dependencies=[require_key])
     def do_optimize(req: OptimizeRequest):
         analysis = analyze(req.model_path)
         ctx = PrintContext(
@@ -130,7 +209,7 @@ def create_app(history_path: str | Path = "job_history.json") -> "FastAPI":
 
         return {"job_id": job_id, **to_dict(result)}
 
-    @app.post("/jobs/{job_id}/approve")
+    @app.post("/jobs/{job_id}/approve", dependencies=[require_key])
     def approve(job_id: str, req: ApproveRequest):
         proposal = pending_proposals.get(job_id)
         if proposal is None:
@@ -159,11 +238,37 @@ def create_app(history_path: str | Path = "job_history.json") -> "FastAPI":
             "next_step": "slicing not yet wired up — see bridge/studio_runner.py",
         }
 
-    @app.get("/jobs")
+    @app.get("/jobs", dependencies=[require_key])
     def list_jobs():
         return history.load_jobs()
 
     return app
+
+
+def _printer_status_to_dict(status: PrinterStatus) -> dict[str, Any]:
+    return {
+        "connected": status.connected,
+        "print_name": status.print_name,
+        "progress_percent": status.progress_percent,
+        "current_layer": status.current_layer,
+        "total_layers": status.total_layers,
+        "remaining_time_min": status.remaining_time_min,
+        "nozzle_temp_c": status.nozzle_temp_c,
+        "bed_temp_c": status.bed_temp_c,
+        "warnings": status.warnings,
+        "ams_slots": [
+            {
+                "slot_index": s.slot_index,
+                "filament_type": s.filament_type,
+                "color": s.color,
+                "humidity": s.humidity,
+            }
+            for s in status.ams_slots
+        ],
+        # `raw` deliberately left out here — it's the full accumulated
+        # MQTT state dict, useful for debugging but noisy for a caller
+        # (ChatGPT included) that just wants the parsed fields above.
+    }
 
 
 def _analysis_to_dict(result) -> dict[str, Any]:
@@ -205,3 +310,34 @@ def _analysis_to_dict(result) -> dict[str, Any]:
         "face_count": result.face_count,
         "vertex_count": result.vertex_count,
     }
+
+
+def main() -> None:
+    """Runs the bridge server directly: `python -m bambu_companion.bridge.server`.
+    Binds to loopback only (127.0.0.1) — a Cloudflare Tunnel (or similar)
+    is what should make this reachable beyond your own PC; this process
+    itself should never listen on 0.0.0.0."""
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Running the bridge needs uvicorn installed: pip install -r requirements-bridge.txt"
+        ) from exc
+
+    api_key = get_or_create_api_key()
+    print("=" * 70)
+    print("Bambu Companion Bridge")
+    print()
+    print("API key (put this in your Custom GPT's Action auth config as a")
+    print("Bearer/API key, header name X-API-Key):")
+    print(f"  {api_key}")
+    print()
+    print("Listening on http://127.0.0.1:8420 (loopback only).")
+    print("=" * 70)
+
+    app = create_app(api_key=api_key)
+    uvicorn.run(app, host="127.0.0.1", port=8420)
+
+
+if __name__ == "__main__":
+    main()

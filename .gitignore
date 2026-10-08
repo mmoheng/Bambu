@@ -5,3 +5,9 @@ venv/
 *.egg-info/
 job_history.json
 .pytest_cache/
+
+# Raw MQTT captures / local test scratch — may contain real printer
+# hardware identifiers (serial, tray UUIDs, chip IDs) or LAN access
+# codes; never meant for the repo.
+mqtt_capture*.jsonl
+*_test_out*.3mf

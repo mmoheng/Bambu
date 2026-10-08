@@ -5,3 +5,9 @@ paho-mqtt>=1.6
 fastapi>=0.110
 uvicorn>=0.29
 pydantic>=2.0
+
+# Only needed to RUN tests/test_server.py (fastapi.testclient.TestClient),
+# not to run the server itself. Starlette 1.2+ moved TestClient onto this
+# package instead of plain httpx (see https://starlette.dev/testclient/) —
+# real, separate PyPI package, not a typo.
+httpx2

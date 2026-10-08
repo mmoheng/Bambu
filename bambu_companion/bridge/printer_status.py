@@ -3,19 +3,39 @@ MQTT API (see the project's Local Bridge Design / ChatGPT Connectivity
 notes — this only works with Developer Mode enabled and the bridge on
 the same LAN as the printer; no cloud dependency).
 
-CONFIDENCE NOTE: the MQTT topic names and report-message shape below
-follow the pattern used by community Bambu LAN integrations (this is the
-same "exploited MQTT protocol" class of access the project's Research
-Findings referenced) — they were NOT independently re-verified against a
-live printer or Bambu's own protocol docs this session. Treat the
-constants in `Topics` as a documented starting point to confirm against
-your actual A1 (a local MQTT client like `mosquitto_sub` pointed at the
-printer's IP with Developer Mode on will show you the real topic/payload
-shape), not as verified fact. This module requires `paho-mqtt`
-(`pip install paho-mqtt`) on the machine running the bridge — not
-available in the sandbox this was developed in, so it has NOT been
-exercised against a real broker; only the parsing/dataclass logic below
-is unit-tested (with synthetic payloads).
+CONFIDENCE NOTE — updated 2026-09-20 against a real A1 (serial redacted,
+host 192.168.1.x, a 45-second idle-printer capture, 17 messages):
+
+CONFIRMED for real: the topic `device/{serial}/report` (note: the
+broker's ACL rejects a wildcard subscribe like `device/+/report` and
+silently disconnects/reconnects the client instead of erroring clearly —
+you must know the real serial ahead of time); the `bblp`/access-code
+auth; the AMS shape (`print.ams.ams[].tray[]` with `tray_type`,
+`tray_color`, `id`, and unit-level `humidity` — matches this module's
+parsing exactly); the `bed_temper` field name and that it's a plain
+float in °C.
+
+CONFIRMED, and a real fix applied because of it: Bambu's `push_status`
+messages are PARTIAL DELTAS, not full state snapshots — across the 17
+captured messages, one had only `ams`, another only `bed_temper`,
+another only `wifi_signal`, never all fields at once. `parse_report_payload`
+now expects to be called with accumulated state (merged across messages
+via `merge_report_delta`), which is what `PrinterStatusClient` does
+internally — calling it directly with a single raw delta message will
+under-report almost everything, by design of the real protocol, not a
+bug in this code.
+
+STILL UNCONFIRMED: `nozzle_temper`, `gcode_state`, `mc_percent`,
+`layer_num`, `total_layer_num`, `subtask_name`, `mc_remaining_time`,
+`hms` — none of these appeared in the idle-printer capture. They may
+only be pushed during an active print, or may use different field
+names entirely; the field-path guesses for these in
+`parse_report_payload` remain UNVERIFIED. Re-capture (see
+`bridge/README.md`) during an actual print job to confirm/fix them
+before trusting progress/temperature reporting during a real print.
+
+This module requires `paho-mqtt` (`pip install paho-mqtt`) on the
+machine running the bridge.
 
 V1 is read-only: this module never publishes a command that changes
 printer state (no start/pause/stop/temperature-override). See the
@@ -70,6 +90,31 @@ class PrinterStatus:
     warnings: list[str]
     ams_slots: list[AmsSlotStatus]
     raw: dict[str, Any]
+
+
+def merge_report_delta(state: dict[str, Any], delta: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merges one MQTT report delta into an accumulated state
+    dict, returning a NEW dict (does not mutate `state`). Confirmed
+    necessary against a real A1 (see module docstring): push_status
+    messages are partial deltas, so the caller must keep one running
+    `state` dict per connection and merge every incoming delta into it
+    before building a PrinterStatus — that's what `PrinterStatusClient`
+    does internally.
+
+    Dict values are merged recursively, key by key. Any other value
+    (including lists, e.g. the AMS `tray` array) is replaced outright by
+    the newer delta's value — confirmed every captured `ams` delta
+    carried its full tray array, never a partial one, so list merging
+    isn't needed and would risk stitching together stale + fresh trays
+    incorrectly if it were.
+    """
+    merged = dict(state)
+    for key, value in delta.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_report_delta(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def parse_report_payload(payload: dict[str, Any]) -> PrinterStatus:
@@ -131,9 +176,12 @@ def _as_int(v: Any) -> Optional[int]:
 
 
 class PrinterStatusClient:
-    """Thin MQTT wrapper. Connects, subscribes to the report topic, and
-    hands each parsed PrinterStatus to `on_status`. Never publishes
-    anything (V1 read-only scope).
+    """Thin MQTT wrapper. Connects, subscribes to the report topic, merges
+    each incoming delta into a running state dict (see `merge_report_delta`
+    — confirmed necessary against a real printer, whose push_status
+    messages are partial, not full snapshots), and hands the resulting
+    PrinterStatus to `on_status`. Never publishes anything (V1 read-only
+    scope).
 
     Usage (on the bridge machine, with paho-mqtt installed):
 
@@ -143,6 +191,11 @@ class PrinterStatusClient:
         )
         client.connect()
         client.loop_forever()  # or loop_start() for a background thread
+
+    NOTE: confirmed against a real A1 that the broker's ACL rejects a
+    wildcard topic subscribe (`device/+/report`) — it silently
+    disconnects/reconnects instead of raising a clear subscribe error —
+    so `serial` must be the printer's real serial number, not a guess.
     """
 
     def __init__(
@@ -163,6 +216,7 @@ class PrinterStatusClient:
         self.serial = serial
         self.access_code = access_code
         self.on_status = on_status
+        self._state: dict[str, Any] = {}
         self._client = mqtt.Client()
         self._client.username_pw_set("bblp", access_code)
         # Bambu's local MQTT broker uses a self-signed cert in LAN/Developer
@@ -193,6 +247,15 @@ class PrinterStatusClient:
     def disconnect(self) -> None:
         self._client.disconnect()
 
+    def reset_state(self) -> None:
+        """Clears accumulated state. Call this if you want to discard
+        stale values (e.g. a previous print's leftover progress) rather
+        than carrying them forward until fresh deltas overwrite them —
+        not called automatically on reconnect, since the printer
+        typically re-sends current values again shortly after a
+        reconnect anyway."""
+        self._state = {}
+
     def _handle_connect(self, client, userdata, flags, rc):  # noqa: ANN001 - paho callback signature
         client.subscribe(Topics.REPORT.format(serial=self.serial))
 
@@ -201,4 +264,6 @@ class PrinterStatusClient:
             payload = json.loads(msg.payload.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
-        self.on_status(parse_report_payload(payload))
+        delta = payload.get("print", payload)
+        self._state = merge_report_delta(self._state, delta)
+        self.on_status(parse_report_payload(self._state))
