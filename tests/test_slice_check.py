@@ -58,8 +58,9 @@ class TestRunSliceCheck(SliceCheckCase):
         self.assertEqual(saved["working_strategy"], "presets")
         self.assertEqual(saved["studio_executable"], str(self.exe))
         self.assertTrue(Path(report["report_path"]).exists())
-        # A bare STL is oriented and arranged, as in Bambu's own example.
-        self.assertIn("--orient", fake.calls[0])
+        # A bare STL is arranged onto the plate but keeps its orientation.
+        self.assertIn("--arrange", fake.calls[0])
+        self.assertNotIn("--orient", fake.calls[0])
         self.assertIn("--curr-bed-type", fake.calls[1])
         self.assertNotIn("--outputdir", fake.calls[2])
 

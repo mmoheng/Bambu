@@ -303,7 +303,7 @@ class TestSliceWithPresets(RunnerCase):
         self.assertTrue(machine_file.endswith("machine.json"))
         self.assertTrue(process_file.endswith("process.json"))
         self.assertIn("--load-filaments", args)
-        self.assertEqual(args[args.index("--orient") + 1], "1")
+        self.assertNotIn("--orient", args)  # the file's orientation is kept
         self.assertEqual(args[args.index("--arrange") + 1], "1")
         self.assertEqual(args[-1], str(self.stl))
         self.assertTrue(result["settings_verified"])

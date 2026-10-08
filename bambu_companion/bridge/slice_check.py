@@ -194,7 +194,7 @@ def run_slice_check(
                 machine_settings_path=machine,
                 process_settings_path=process,
                 filament_settings_paths=filaments,
-                orient=not is_project,
+                orient=False,  # keep the file's orientation, as slicing does (see studio_runner)
                 arrange=not is_project,
             )
             attempts.append(

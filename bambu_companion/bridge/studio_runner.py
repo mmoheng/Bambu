@@ -576,7 +576,7 @@ def slice_with_presets(
     changes: Mapping[str, Any] | None = None,
     bed_type: str | None = None,
     executable_path: str | os.PathLike | None = None,
-    orient: bool = True,
+    orient: bool = False,
     arrange: bool = True,
     use_outputdir: bool = True,
     timeout_s: float = 900.0,
@@ -584,8 +584,15 @@ def slice_with_presets(
 ) -> dict[str, Any]:
     """Slices a bare STL (or a 3MF) with full machine + process +
     filament configs built from named presets, `changes` applied to the
-    process config. Orients and arranges by default, as Bambu's STL
-    example does — a bare STL has no plate position of its own.
+    process config.
+
+    Arranges by default (a bare STL has no plate position of its own)
+    but does NOT auto-orient. Bambu's own STL example passes --orient,
+    and the first real slices here did too — and on 2026-10-08 that
+    stood Matt's deck-box lid (deliberately exported upside down so the
+    pocket prints facing the plate) on its side: an 89 mm part came out
+    118.8 mm tall with 1,173 layers. Bambu Studio's window keeps a
+    file's orientation on import; so does this, unless asked.
     """
     # Absolute: Bambu Studio is started in a scratch folder, so a
     # relative path would point at nothing there.

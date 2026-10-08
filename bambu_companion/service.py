@@ -35,7 +35,7 @@ from .bridge.job_history import JobHistoryStore, JobRecord, new_job_id, now_iso
 from .bridge.printer_config import load_printer_config
 from .bridge.studio_config import config_dir, load_studio_config
 from .gui_logic import DEFAULT_CURRENT_SETTINGS
-from .model_analyzer import analyze
+from .model_analyzer import analyze, load_mesh
 from .model_analyzer.mesh_io import MeshLoadError
 from .optimizer import optimize, to_dict
 from .profiles import project_3mf
@@ -110,6 +110,32 @@ def _wait_seconds(value: Any, default: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
         raise ServiceError("wait_s must be a number of seconds.")
     return min(max(float(value), 0.0), MAX_WAIT_S)
+
+
+def _model_height(model: Path) -> float | None:
+    """Height of the model as it sits in the file (None if unreadable)."""
+    try:
+        mesh = load_mesh(model)
+    except (MeshLoadError, OSError):
+        return None
+    return float(mesh.vertices[:, 2].max() - mesh.vertices[:, 2].min())
+
+
+def _orientation_check(expected_height: float | None, plates: list[dict[str, Any]]) -> str | None:
+    """A warning if the sliced part's height doesn't match the model's
+    — the sign that it was turned over before slicing, which changes
+    where supports go and how long it takes."""
+    if expected_height is None:
+        return None
+    for plate in plates:
+        sliced = plate.get("max_z_mm")
+        if sliced is not None and abs(sliced - expected_height) > 1.0:
+            return (
+                f"The model is {expected_height:.1f} mm tall as saved, but the sliced result is "
+                f"{sliced:.1f} mm tall — it was printed in a different orientation. Check the "
+                "preview in Bambu Studio before printing."
+            )
+    return None
 
 
 def analysis_to_dict(result: AnalysisResult) -> dict[str, Any]:
@@ -656,6 +682,9 @@ class CompanionService:
                 "filaments": [filament or fallback["filament"]],
             }
 
+        # The model's own height, to catch Bambu Studio turning it over.
+        expected_height = _model_height(model) if use_presets else None
+
         destination = self._reserve_output(output_path, model.parent, f"{model.stem}_companion_sliced")
 
         def run() -> dict[str, Any]:
@@ -675,7 +704,7 @@ class CompanionService:
                 changes=typed,
                 bed_type=config["default_bed_type"] if "bed" in modifiers else None,
                 executable_path=exe,
-                orient=not is_project,
+                orient=False,  # keep the file's orientation (see studio_runner.slice_with_presets)
                 arrange=not is_project,
                 use_outputdir="fullpath" not in modifiers,
                 runner=runner,
@@ -708,6 +737,9 @@ class CompanionService:
             }
             if result.get("output_renamed"):
                 summary["output_renamed"] = result["output_renamed"]
+            orientation = _orientation_check(expected_height, result["slice_result"])
+            if orientation:
+                summary["orientation_warning"] = orientation
             if not verified:
                 summary["warning"] = (
                     "Bambu Studio sliced the file but did NOT keep every requested setting — "

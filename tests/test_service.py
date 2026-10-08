@@ -19,6 +19,8 @@ from bambu_companion.service import (
     PRINTER_STALE_AFTER_S,
     CompanionService,
     ServiceError,
+    _model_height,
+    _orientation_check,
     _wait_seconds,
 )
 
@@ -231,14 +233,17 @@ class TestSliceModel(ServiceCase):
         (job,) = self.service.job_history()
         self.assertEqual(job["slice_result"], "success")
 
-    def test_stl_is_sliced_from_presets_with_orient_and_arrange(self):
+    def test_stl_is_sliced_from_presets_arranged_but_not_reoriented(self):
         task = self.finished(self.service.slice_model(model_path=str(self.stl), changes={"wall_loops": 3}))
         self.assertEqual(task["state"], "done", task)
         self.assertEqual(task["result"]["strategy"], "presets")
         self.assertEqual(task["result"]["presets"]["machine"], "Bambu Lab A1 0.4 nozzle")
         args = self.fake.calls[0]
         self.assertIn("--load-settings", args)
-        self.assertIn("--orient", args)
+        self.assertIn("--arrange", args)
+        # Auto-orient once stood a deck-box lid on its side (89 mm part
+        # sliced 118.8 mm tall); the file's orientation is kept.
+        self.assertNotIn("--orient", args)
 
     def test_saved_strategy_modifiers_are_applied(self):
         update_studio_config(working_strategy="presets+bed+fullpath")
@@ -722,6 +727,38 @@ class TestPrinterStatusFailures(ServiceCase):
         self.assertFalse(status["connected"])
         self.assertIn("last known values", status["message"])
         self.assertEqual(status["bed_temp_c"], 24.5)
+
+
+class TestOrientationCheck(ServiceCase):
+    def test_matching_height_gives_no_warning(self):
+        self.assertIsNone(_orientation_check(87.0, [{"max_z_mm": 87.0}]))
+        self.assertIsNone(_orientation_check(87.0, [{"max_z_mm": 87.08}]))
+        self.assertIsNone(_orientation_check(None, [{"max_z_mm": 5.0}]))
+        self.assertIsNone(_orientation_check(87.0, [{}]))
+
+    def test_turned_over_part_is_flagged(self):
+        # The real case: an 89.05 mm lid sliced 118.76 mm tall.
+        warning = _orientation_check(89.05, [{"max_z_mm": 118.76}])
+        self.assertIn("89.0 mm tall", warning)
+        self.assertIn("118.8 mm tall", warning)
+
+    def test_slice_result_carries_the_warning(self):
+        class TurnsItOver(FakeStudio):
+            def __call__(self, executable, args, **kwargs):
+                run = super().__call__(executable, args, **kwargs)
+                return run  # the fixture's G-code header always says 88.96 mm
+
+        # 20 mm cube vs. the fixture's 88.96 mm sliced height -> flagged.
+        task = self.finished(
+            CompanionService(runner=TurnsItOver(), library=self.library).slice_model(
+                model_path=str(self.stl), wait_s=10
+            )
+        )
+        self.assertEqual(task["state"], "done", task)
+        self.assertIn("different orientation", task["result"]["orientation_warning"])
+
+    def test_model_height(self):
+        self.assertAlmostEqual(_model_height(self.stl), 20.0)
 
 
 if __name__ == "__main__":
