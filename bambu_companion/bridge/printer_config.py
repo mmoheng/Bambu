@@ -17,9 +17,10 @@ don't treat this file as a secrets vault beyond that.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
+
+from ..app_dirs import user_data_root
 
 CONFIG_DIR_NAME = "BambuCompanion"
 CONFIG_FILE_NAME = "printer_config.json"
@@ -32,9 +33,7 @@ _DEFAULTS: dict[str, Any] = {
 
 
 def default_config_path() -> Path:
-    base = os.environ.get("APPDATA")
-    root = Path(base) if base else Path.home()
-    return root / CONFIG_DIR_NAME / CONFIG_FILE_NAME
+    return user_data_root() / CONFIG_DIR_NAME / CONFIG_FILE_NAME
 
 
 def load_printer_config(path: Path | None = None) -> dict[str, Any]:

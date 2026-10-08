@@ -13,6 +13,8 @@ without changing the public functions below (`record_job`, `load_jobs`,
 from __future__ import annotations
 
 import json
+import os
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -46,6 +48,10 @@ class JobHistoryStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The connector handles tool calls on separate threads and a
+        # slice finishes on yet another; every read-modify-write below
+        # holds this lock.
+        self._lock = threading.RLock()
         if not self.path.exists():
             self.path.write_text("[]", encoding="utf-8")
 
@@ -58,24 +64,31 @@ class JobHistoryStore:
             ) from exc
 
     def _write_all(self, records: list[dict[str, Any]]) -> None:
-        self.path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        # Write a sibling temp file, then swap it in: a crash or a
+        # concurrent reader never sees a half-written history.
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)
 
     def record_job(self, job: JobRecord) -> None:
-        records = self._read_all()
-        records.append(asdict(job))
-        self._write_all(records)
+        with self._lock:
+            records = self._read_all()
+            records.append(asdict(job))
+            self._write_all(records)
 
     def update_job(self, job_id: str, **fields: Any) -> None:
-        records = self._read_all()
-        for r in records:
-            if r["id"] == job_id:
-                r.update(fields)
-                self._write_all(records)
-                return
+        with self._lock:
+            records = self._read_all()
+            for r in records:
+                if r["id"] == job_id:
+                    r.update(fields)
+                    self._write_all(records)
+                    return
         raise KeyError(f"No job with id {job_id!r} in {self.path}")
 
     def load_jobs(self) -> list[dict[str, Any]]:
-        return self._read_all()
+        with self._lock:
+            return self._read_all()
 
     def find_reference_jobs(self, model_file: Optional[str] = None) -> list[dict[str, Any]]:
         """Jobs the user marked as good outcomes — the memory bank's

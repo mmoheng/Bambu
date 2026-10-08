@@ -25,6 +25,7 @@ from typing import Any
 from .model_analyzer import analyze
 from .model_analyzer.mesh_io import MeshLoadError
 from .optimizer import optimize
+from .profiles.bambu_values import overlay
 from .profiles.temp_profile import apply_changes
 from .schemas import AnalysisResult, OptimizationResult, PrintContext, PrintGoal
 
@@ -209,7 +210,13 @@ def build_full_export_profile(
     Studio rather than a partial diff.
     """
     base = full_profile if full_profile is not None else run.context.current_settings
-    return apply_changes(base, run.optimization.changes, approved_keys)
+    # apply_changes enforces "approved must have been proposed"; overlay
+    # then writes each approved value in the representation the base
+    # file already uses. A real Bambu Studio export stores "4", "20%",
+    # ["120"] — overlaying bare numbers onto it (what this did before)
+    # produced a file Bambu Studio doesn't reliably import.
+    approved = apply_changes({}, run.optimization.changes, approved_keys)
+    return overlay(base, approved)
 
 
 def build_export_text(run: AnalysisRun, approved_keys: set[str]) -> str:

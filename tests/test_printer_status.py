@@ -3,6 +3,7 @@ import unittest
 from bambu_companion.bridge.printer_status import (
     merge_report_delta,
     parse_report_payload,
+    status_to_dict,
 )
 
 # Shapes below are drawn from a real 45-second capture against a Bambu Lab
@@ -145,6 +146,69 @@ class TestParseReportPayloadAgainstRealShapes(unittest.TestCase):
         status = parse_report_payload(REAL_WIFI_ONLY_DELTA)
         self.assertIsNone(status.bed_temp_c)
         self.assertEqual(status.ams_slots, [])
+
+
+class TestStatusToDict(unittest.TestCase):
+    def test_keeps_parsed_fields_and_drops_hardware_identifiers(self):
+        state = merge_report_delta({}, REAL_AMS_DELTA)
+        state = merge_report_delta(state, {"bed_temper": 24.5, "gcode_state": "IDLE"})
+        data = status_to_dict(parse_report_payload(state))
+        self.assertEqual(data["bed_temp_c"], 24.5)
+        self.assertEqual(data["state"], "IDLE")
+        self.assertEqual(len(data["ams_slots"]), 2)
+        self.assertEqual(data["ams_slots"][0]["filament_type"], "PLA")
+        # Field NAMES only (whatever the printer sent), never their values.
+        self.assertTrue({"ams", "bed_temper", "gcode_state"} <= set(data["fields_received"]))
+        self.assertTrue(all(isinstance(name, str) for name in data["fields_received"]))
+        flat = repr(data)
+        for identifier in ("placeholder-chip-id", "placeholder-ams-id", "placeholder-uuid-0"):
+            self.assertNotIn(identifier, flat)
+        self.assertNotIn("raw", data)
+
+    def test_wrapped_payload_is_handled_the_same(self):
+        data = status_to_dict(parse_report_payload({"print": {"bed_temper": 60.0}}))
+        self.assertEqual(data["bed_temp_c"], 60.0)
+        self.assertEqual(data["fields_received"], ["bed_temper"])
+
+
+class _FakePahoClient:
+    def __init__(self, *args):
+        self.args = args
+
+    def username_pw_set(self, *a):
+        pass
+
+    def tls_set(self, **kw):
+        pass
+
+    def tls_insecure_set(self, value):
+        pass
+
+
+class TestPahoVersionCompatibility(unittest.TestCase):
+    """paho-mqtt 2.x requires a callback API version; 1.x has none."""
+
+    def _client_args(self, fake_module):
+        from unittest import mock
+
+        from bambu_companion.bridge import printer_status as ps
+
+        with mock.patch.object(ps, "mqtt", fake_module):
+            client = ps.PrinterStatusClient(host="h", serial="s", access_code="c", on_status=lambda s: None)
+        return client._client.args
+
+    def test_paho_2_gets_the_version_1_callback_api(self):
+        import types
+
+        fake = types.SimpleNamespace(
+            Client=_FakePahoClient, CallbackAPIVersion=types.SimpleNamespace(VERSION1="V1", VERSION2="V2")
+        )
+        self.assertEqual(self._client_args(fake), ("V1",))
+
+    def test_paho_1_is_constructed_with_no_arguments(self):
+        import types
+
+        self.assertEqual(self._client_args(types.SimpleNamespace(Client=_FakePahoClient)), ())
 
 
 if __name__ == "__main__":

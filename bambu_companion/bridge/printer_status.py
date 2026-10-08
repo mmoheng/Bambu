@@ -161,6 +161,46 @@ def parse_report_payload(payload: dict[str, Any]) -> PrinterStatus:
     )
 
 
+def status_to_dict(status: PrinterStatus) -> dict[str, Any]:
+    """PrinterStatus as plain JSON-friendly data for a caller outside
+    this PC (the connector, the HTTP bridge).
+
+    Deliberately leaves out `raw` — the accumulated MQTT state carries
+    hardware identifiers (serial, tray UUIDs, chip IDs) that have no
+    business leaving the machine. `fields_received` lists only the
+    *names* of the top-level fields seen so far: enough to tell whether
+    the still-unconfirmed mid-print fields (see module docstring) are
+    arriving under the names this parser expects, without the values.
+    """
+    print_data = status.raw.get("print", status.raw) if isinstance(status.raw, dict) else {}
+    return {
+        "connected": status.connected,
+        "print_name": status.print_name,
+        "state": print_data.get("gcode_state"),
+        "progress_percent": status.progress_percent,
+        "current_layer": status.current_layer,
+        "total_layers": status.total_layers,
+        "remaining_time_min": status.remaining_time_min,
+        "nozzle_temp_c": status.nozzle_temp_c,
+        "bed_temp_c": status.bed_temp_c,
+        "warnings": status.warnings,
+        "ams_slots": [
+            {
+                "slot_index": s.slot_index,
+                "filament_type": s.filament_type,
+                "color": s.color,
+                "humidity": s.humidity,
+            }
+            for s in status.ams_slots
+        ],
+        "fields_received": sorted(str(k) for k in print_data),
+        "unconfirmed_fields": (
+            "state, progress, layers, remaining time and nozzle temperature use field names "
+            "that have not yet been confirmed against this printer during a print"
+        ),
+    }
+
+
 def _as_float(v: Any) -> Optional[float]:
     try:
         return float(v) if v is not None else None
@@ -217,7 +257,13 @@ class PrinterStatusClient:
         self.access_code = access_code
         self.on_status = on_status
         self._state: dict[str, Any] = {}
-        self._client = mqtt.Client()
+        # paho-mqtt 2.x made the callback API version an explicit
+        # argument; the callbacks below use the 1.x signatures, which
+        # VERSION1 keeps. paho-mqtt 1.x has no such argument.
+        if hasattr(mqtt, "CallbackAPIVersion"):
+            self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+        else:
+            self._client = mqtt.Client()
         self._client.username_pw_set("bblp", access_code)
         # Bambu's local MQTT broker uses a self-signed cert in LAN/Developer
         # Mode; this disables hostname/cert verification for the LOCAL
@@ -233,9 +279,12 @@ class PrinterStatusClient:
         try:
             self._client.connect(self.host, self.port, keepalive=30)
         except OSError as exc:
+            # No address in the message: it is returned to callers
+            # outside this PC (the HTTP bridge, the connector). The OS
+            # error is kept as the exception's cause for local debugging.
             raise PrinterConnectionError(
-                f"Could not reach printer at {self.host}:{self.port} — is it powered on, on "
-                "the same LAN, and in Developer/LAN Mode? ({exc})"
+                "Could not reach the printer at its saved address — is it powered on, on "
+                f"the same LAN, and in Developer/LAN Mode? ({type(exc).__name__})"
             ) from exc
 
     def loop_start(self) -> None:

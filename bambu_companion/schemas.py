@@ -64,6 +64,13 @@ class OverhangSummary:
     overhang_area_mm2: float
     overhang_face_count: int
     worst_face_tilt_deg: Optional[float]  # 0 = flat overhang, 90 = vertical wall
+    # Overhang faces grouped into connected regions ("islands"). One big
+    # region needs support; forty 5 mm^2 ones (drips, text, small chamfers)
+    # usually don't — the total area alone can't tell those apart.
+    # island_count == 0 with overhang_face_count > 0 means "not computed"
+    # (an AnalysisResult built by hand or by an older version).
+    island_count: int = 0
+    largest_island_area_mm2: float = 0.0
 
 
 @dataclass(frozen=True)

@@ -228,14 +228,19 @@ def create_app(
 
         history.update_job(job_id, approved_keys=req.approved_keys, applied_settings=temp_settings)
 
-        # Slicing (bridge.studio_runner) intentionally NOT wired in here yet
-        # — it needs a real Bambu Studio install + confirmed CLI flags on
-        # this machine (see studio_runner.py's module docstring) before
-        # it's safe to call from a live endpoint.
+        # Slicing intentionally NOT wired in here yet. The runner was
+        # rewritten on 2026-10-07 (see studio_runner.py) but headless
+        # slicing has not been confirmed on a real install; an
+        # internet-reachable endpoint is the last place to find out.
+        # Once `python -m bambu_companion.bridge.slice_check` passes,
+        # call `service.CompanionService.slice_model` from here.
         return {
             "job_id": job_id,
             "applied_settings": temp_settings,
-            "next_step": "slicing not yet wired up — see bridge/studio_runner.py",
+            "next_step": (
+                "slicing not wired into the HTTP bridge yet — run "
+                "bambu_companion.bridge.slice_check first (see bridge/README.md)"
+            ),
         }
 
     @app.get("/jobs", dependencies=[require_key])

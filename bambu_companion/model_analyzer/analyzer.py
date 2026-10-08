@@ -28,6 +28,7 @@ the project's "flag uncertainty" rule):
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 from scipy.spatial import ConvexHull
@@ -74,8 +75,9 @@ def analyze(
     thin_wall_sample_count: int = 250,
     orientation_candidate_count: int = 3,
     random_seed: int = 0,
+    object_ids: Iterable[str] | None = None,
 ) -> AnalysisResult:
-    mesh = load_mesh(path)
+    mesh = load_mesh(path, object_ids=object_ids)
     normals, areas = geo.face_normals_and_areas(mesh)
     tilts = geo.face_tilt_from_horizontal_deg(normals)
 
@@ -225,11 +227,14 @@ def _overhangs(
     flagged = above_bed & facing_down & (tilts < threshold_deg)
 
     worst = float(tilts[flagged].min()) if flagged.any() else None
+    islands = geo.connected_components_of_subset(mesh, np.nonzero(flagged)[0])
     return OverhangSummary(
         threshold_deg=threshold_deg,
         overhang_area_mm2=float(areas[flagged].sum()),
         overhang_face_count=int(flagged.sum()),
         worst_face_tilt_deg=worst,
+        island_count=len(islands),
+        largest_island_area_mm2=max((float(areas[i].sum()) for i in islands), default=0.0),
     )
 
 

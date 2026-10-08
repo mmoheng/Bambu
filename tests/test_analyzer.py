@@ -2,9 +2,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from bambu_companion.model_analyzer.analyzer import analyze
 
-from .mesh_fixtures import annulus_soup, bridge_soup, cube_soup, two_separate_cubes_soup, write_stl_binary
+from .mesh_fixtures import (
+    annulus_soup,
+    box_triangle_soup,
+    bridge_soup,
+    cube_soup,
+    two_separate_cubes_soup,
+    write_stl_binary,
+)
 
 
 def _analyze_soup(soup, **kwargs):
@@ -58,6 +67,44 @@ class TestOverhangsAndBridges(unittest.TestCase):
         # beam -> tilt from horizontal should be ~0 deg (flat).
         self.assertIsNotNone(result.overhangs.worst_face_tilt_deg)
         self.assertLess(result.overhangs.worst_face_tilt_deg, 5.0)
+
+
+class TestOverhangRegions(unittest.TestCase):
+    def test_no_overhangs_means_no_regions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cube.stl"
+            write_stl_binary(cube_soup(20.0), path)
+            oh = analyze(path).overhangs
+            self.assertEqual(oh.island_count, 0)
+            self.assertEqual(oh.largest_island_area_mm2, 0.0)
+
+    def test_bridge_fixture_overhang_is_one_region_holding_all_the_area(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge.stl"
+            write_stl_binary(bridge_soup(), path)
+            oh = analyze(path).overhangs
+            self.assertEqual(oh.island_count, 1)
+            self.assertAlmostEqual(oh.largest_island_area_mm2, oh.overhang_area_mm2)
+            self.assertGreater(oh.largest_island_area_mm2, 0)
+
+    def test_two_separate_overhangs_are_two_regions(self):
+        # Two tables side by side: each table top's underside is its own
+        # overhanging region, and neither is "all" of the overhang area.
+        def table(x0):
+            return np.concatenate(
+                [
+                    box_triangle_soup(x0, 0, 0, x0 + 2, 10, 10),  # leg
+                    box_triangle_soup(x0 + 18, 0, 0, x0 + 20, 10, 10),  # leg
+                    box_triangle_soup(x0, 0, 10, x0 + 20, 10, 12),  # top
+                ]
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tables.stl"
+            write_stl_binary(np.concatenate([table(0.0), table(50.0)]), path)
+            oh = analyze(path).overhangs
+            self.assertEqual(oh.island_count, 2)
+            self.assertAlmostEqual(oh.largest_island_area_mm2, oh.overhang_area_mm2 / 2, places=3)
 
 
 class TestOrientationCandidates(unittest.TestCase):

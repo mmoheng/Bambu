@@ -29,6 +29,28 @@ Bambu Bridge (bambu_companion/bridge/)   <- runs on the Windows PC
                                       unverified — needs a real printer]
 ```
 
+A second front door, added 2026-10-07, reaches the same boxes without
+the cloud relay:
+
+```
+Claude Desktop (on the same PC)
+    |  stdin/stdout, Model Context Protocol
+    v
+bambu_companion/mcp_server.py        <- protocol only, stdlib, no logic
+    |
+    v
+bambu_companion/service.py           <- every operation as plain Python
+    |
+    +--> Model Analyzer, Print Optimizer, Job History   (as above)
+    +--> profiles/project_3mf.py     read / copy-with-changes a project file
+    +--> bridge/studio_runner.py     slice (after bridge/slice_check.py passes)
+    +--> bridge/printer_status.py    read-only status
+```
+
+`service.py` is deliberately framework-free so the HTTP bridge can call
+the same methods once slicing is confirmed, instead of the two front
+doors growing separate logic.
+
 Supporting pieces that cut across the diagram:
 
 - `bambu_companion/schemas.py` — the shapes every box above passes to the
@@ -54,12 +76,25 @@ Supporting pieces that cut across the diagram:
   not a stylistic choice — but it also means the Windows bridge doesn't
   need those heavier packages either, which is arguably a nice side
   effect for something meant to be lightweight to install.
-- **Two confidence tiers for setting keys.** `profiles/bambu_settings.py`
-  marks each setting key `verified` (confirmed against Bambu's own
-  sources during the design review) or not (standard, likely-correct,
-  but not individually re-checked this session). The optimizer discloses
-  this in its `uncertainties` output rather than presenting every
-  recommendation with equal confidence.
+- **The settings registry is also the allowlist.**
+  `profiles/bambu_settings.py` lists every setting this project may
+  read, recommend or write, with its type and a sane range; nothing
+  outside it is ever written into a profile or project file. That is
+  how "no arbitrary G-code, no safety-limit changes" is enforced in
+  code rather than by convention. Each key also carries a `verified`
+  flag (seen in a real Bambu Studio file or not); the optimizer
+  discloses any recommendation whose key isn't.
+- **Typed values inside, Bambu's strings at the edge.**
+  `profiles/bambu_values.py` converts between `"15%"` / `["200"]` /
+  `"1"` and `15` / `200` / `True`, and writes changes back in whatever
+  shape the target file already uses.
+- **Outputs never replace a file.** `write_project_copy` and the
+  runner's `place_exclusive` create their output with exclusive mode, so
+  a name that is already taken — even one taken *during* a long slice —
+  is an error or leads to the next free name, never a silent
+  replacement. (This covers the service, the connector and the runner.
+  The desktop GUI's "Export recommendations" is older code and still
+  rewrites its own previous export files.)
 - **Geometric heuristics are labeled as heuristics.** Overhang/bridge
   detection, thin-wall thickness, hole detection, and orientation ranking
   are all documented in their docstrings as approximations of what a real

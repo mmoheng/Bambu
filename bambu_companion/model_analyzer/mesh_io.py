@@ -7,7 +7,9 @@ enough to parse directly with the standard library plus numpy (which is
 assumed available everywhere this runs).
 
 Only geometry is extracted — for 3MF that means triangle meshes from
-<object>/<mesh> elements with any <build> transform applied. Slicer
+<object>/<mesh> elements (including meshes referenced through
+<components>, which is how Bambu Studio project files store them) with
+component and <build> transforms applied. Slicer
 metadata (plate layout, per-object settings, etc.) in a Bambu Studio
 project 3MF is intentionally ignored; the analyzer only cares about the
 solid geometry.
@@ -23,6 +25,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 
@@ -49,16 +52,32 @@ class Mesh:
         return self.vertices[self.faces]
 
 
-def load_mesh(path: str | Path) -> Mesh:
+def load_mesh(path: str | Path, *, object_ids: Iterable[str] | None = None) -> Mesh:
+    """Loads a mesh. `object_ids` (3MF only) restricts loading to those
+    build items — used to analyse one plate of a multi-plate project
+    instead of fusing every plate into one impossible object.
+
+    Anything wrong with the file comes out as MeshLoadError with a
+    message a person can act on, never as a bare ValueError/IndexError
+    from deep inside the parser.
+    """
     path = Path(path)
     suffix = path.suffix.lower()
-    if suffix == ".stl":
-        return _load_stl(path)
-    if suffix == ".3mf":
-        return _load_3mf(path)
-    raise MeshLoadError(
-        f"Unsupported file type '{suffix}'. Bambu Companion V1 supports .stl and .3mf."
-    )
+    if suffix not in (".stl", ".3mf"):
+        raise MeshLoadError(
+            f"Unsupported file type '{suffix}'. Bambu Companion V1 supports .stl and .3mf."
+        )
+    try:
+        mesh = _load_stl(path) if suffix == ".stl" else _load_3mf(path, object_ids)
+    except MeshLoadError:
+        raise
+    except (ValueError, TypeError, IndexError, KeyError, OverflowError, struct.error) as exc:
+        raise MeshLoadError(f"{path.name} is damaged or not a valid {suffix} file ({exc}).") from exc
+    if mesh.face_count == 0 or mesh.vertex_count == 0:
+        raise MeshLoadError(f"{path.name} contains no triangles.")
+    if mesh.faces.min() < 0 or mesh.faces.max() >= mesh.vertex_count:
+        raise MeshLoadError(f"{path.name} is damaged: a triangle refers to a vertex that doesn't exist.")
+    return mesh
 
 
 # ---------------------------------------------------------------------------
@@ -158,49 +177,110 @@ def _weld_vertices(raw_vertices: np.ndarray, faces_into_raw: np.ndarray, decimal
 _3MF_NS = "{http://schemas.microsoft.com/3dmanufacturing/core/2015/02}"
 
 
-def _load_3mf(path: Path) -> Mesh:
-    with zipfile.ZipFile(path) as zf:
-        model_path = _find_3mf_model_part(zf)
-        with zf.open(model_path) as f:
-            root = ET.parse(f).getroot()
+_3MF_PRODUCTION_NS = "{http://schemas.microsoft.com/3dmanufacturing/production/2015/06}"
+_3MF_MAX_COMPONENT_DEPTH = 8
 
-    objects: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    resources = root.find(f"{_3MF_NS}resources")
-    if resources is None:
-        raise MeshLoadError("3MF file has no <resources> element.")
 
-    for obj in resources.findall(f"{_3MF_NS}object"):
-        mesh_el = obj.find(f"{_3MF_NS}mesh")
-        if mesh_el is None:
-            continue  # components-only object; skipped in V1
-        obj_id = obj.get("id")
-        objects[obj_id] = _parse_3mf_mesh(mesh_el)
+def _load_3mf(path: Path, object_ids: Iterable[str] | None = None) -> Mesh:
+    """Loads every printable build item of a 3MF (or only those whose
+    `objectid` is in `object_ids`) as one mesh.
 
-    build = root.find(f"{_3MF_NS}build")
-    if build is None or not list(build):
-        # No build items (unusual) — fall back to concatenating every object as-is.
-        items = [(obj_id, None) for obj_id in objects]
-    else:
-        items = []
-        for item in build.findall(f"{_3MF_NS}item"):
-            obj_id = item.get("objectid")
-            transform_attr = item.get("transform")
-            transform = _parse_3mf_transform(transform_attr) if transform_attr else None
-            items.append((obj_id, transform))
+    Handles both layouts seen in practice:
 
-    all_vertices: list[np.ndarray] = []
-    all_faces: list[np.ndarray] = []
-    vertex_offset = 0
-    for obj_id, transform in items:
-        if obj_id not in objects:
-            continue
-        verts, faces = objects[obj_id]
-        if transform is not None:
-            linear, translation = transform
-            verts = verts @ linear + translation
-        all_vertices.append(verts)
-        all_faces.append(faces + vertex_offset)
-        vertex_offset += verts.shape[0]
+    - plain 3MF: ``<object><mesh>`` directly in ``3D/3dmodel.model``;
+    - Bambu Studio / production-extension projects, where the root model
+      part only holds ``<object><components><component p:path=
+      "/3D/Objects/object_N.model" objectid=...>`` references and the
+      triangles live in those separate parts. Confirmed against a real
+      Bambu Studio project file: without following these references a
+      project 3MF loads as "no usable mesh geometry".
+    """
+    try:
+        zf_ctx = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise MeshLoadError(f"{path} is not a valid 3MF (zip) file: {exc}") from exc
+
+    with zf_ctx as zf:
+        names = set(zf.namelist())
+        root_part = _find_3mf_model_part(zf)
+        part_cache: dict[str, dict[str, ET.Element]] = {}
+        part_roots: dict[str, ET.Element] = {}
+
+        def load_part(part: str) -> dict[str, ET.Element]:
+            if part not in part_cache:
+                if part not in names:
+                    raise MeshLoadError(f"3MF references a missing model part: {part}")
+                with zf.open(part) as f:
+                    try:
+                        part_root = ET.parse(f).getroot()
+                    except ET.ParseError as exc:
+                        raise MeshLoadError(f"3MF model part {part} is not valid XML: {exc}") from exc
+                part_roots[part] = part_root
+                resources_el = part_root.find(f"{_3MF_NS}resources")
+                part_cache[part] = (
+                    {obj.get("id"): obj for obj in resources_el.findall(f"{_3MF_NS}object")}
+                    if resources_el is not None
+                    else {}
+                )
+            return part_cache[part]
+
+        def resolve(part: str, obj_id: str, depth: int) -> list[tuple[np.ndarray, np.ndarray]]:
+            """Returns the (vertices, faces) pieces making up one object,
+            with every component transform already applied."""
+            if depth > _3MF_MAX_COMPONENT_DEPTH:
+                raise MeshLoadError("3MF component references are nested too deeply (cycle?).")
+            obj = load_part(part).get(obj_id)
+            if obj is None:
+                return []
+            mesh_el = obj.find(f"{_3MF_NS}mesh")
+            if mesh_el is not None:
+                return [_parse_3mf_mesh(mesh_el)]
+            pieces: list[tuple[np.ndarray, np.ndarray]] = []
+            components_el = obj.find(f"{_3MF_NS}components")
+            for comp in components_el.findall(f"{_3MF_NS}component") if components_el is not None else []:
+                target_part = comp.get(f"{_3MF_PRODUCTION_NS}path")
+                target_part = target_part.lstrip("/") if target_part else part
+                transform_attr = comp.get("transform")
+                for verts, faces in resolve(target_part, comp.get("objectid"), depth + 1):
+                    if transform_attr:
+                        linear, translation = _parse_3mf_transform(transform_attr)
+                        verts = verts @ linear + translation
+                    pieces.append((verts, faces))
+            return pieces
+
+        root_objects = load_part(root_part)
+        if root_part not in part_roots or part_roots[root_part].find(f"{_3MF_NS}resources") is None:
+            raise MeshLoadError("3MF file has no <resources> element.")
+
+        build = part_roots[root_part].find(f"{_3MF_NS}build")
+        if build is None or not list(build):
+            # No build items (unusual) — fall back to concatenating every object as-is.
+            items = [(obj_id, None) for obj_id in root_objects]
+        else:
+            items = []
+            for item in build.findall(f"{_3MF_NS}item"):
+                if item.get("printable") == "0":
+                    continue  # Bambu Studio marks objects parked off the plate this way
+                transform_attr = item.get("transform")
+                transform = _parse_3mf_transform(transform_attr) if transform_attr else None
+                items.append((item.get("objectid"), transform))
+
+        wanted = None if object_ids is None else {str(i) for i in object_ids}
+        all_vertices: list[np.ndarray] = []
+        all_faces: list[np.ndarray] = []
+        vertex_offset = 0
+        for obj_id, transform in items:
+            if wanted is not None and str(obj_id) not in wanted:
+                continue
+            for verts, faces in resolve(root_part, obj_id, 0):
+                if verts.size == 0 or faces.size == 0:
+                    continue
+                if transform is not None:
+                    linear, translation = transform
+                    verts = verts @ linear + translation
+                all_vertices.append(verts)
+                all_faces.append(faces + vertex_offset)
+                vertex_offset += verts.shape[0]
 
     if not all_vertices:
         raise MeshLoadError("3MF file contained no usable mesh geometry.")

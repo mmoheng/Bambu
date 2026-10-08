@@ -254,6 +254,28 @@ class TestBuildFullExportProfile(unittest.TestCase):
                 continue
             self.assertEqual(value, DEFAULT_CURRENT_SETTINGS.get(key))
 
+    def test_real_bambu_profile_gets_values_in_bambu_format(self):
+        # A profile exported from Bambu Studio stores strings, "15%",
+        # and one-element lists; the export must stay in that format.
+        full_profile = {
+            "name": "0.20mm Standard @BBL A1",
+            "wall_loops": "2",
+            "layer_height": "0.2",
+            "sparse_infill_density": "15%",
+            "outer_wall_speed": ["200"],
+            "elefant_foot_compensation": "0",
+            "some_key_this_project_never_heard_of": "keep-me",
+        }
+        approved = {c.key for c in self.run.optimization.changes}
+        merged = build_full_export_profile(self.run, approved, full_profile)
+        recommended = {c.key: c.recommended_value for c in self.run.optimization.changes}
+        self.assertEqual(merged["wall_loops"], str(recommended["wall_loops"]))
+        self.assertEqual(merged["sparse_infill_density"], f"{recommended['sparse_infill_density']}%")
+        self.assertEqual(merged["outer_wall_speed"], [str(recommended["outer_wall_speed"])])
+        self.assertEqual(merged["some_key_this_project_never_heard_of"], "keep-me")
+        for value in merged.values():
+            self.assertIsInstance(value, (str, list))
+
     def test_none_full_profile_falls_back_to_context_current_settings(self):
         merged = build_full_export_profile(self.run, set(), None)
         self.assertEqual(set(merged.keys()), set(self.run.context.current_settings.keys()))

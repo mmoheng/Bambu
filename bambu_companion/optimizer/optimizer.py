@@ -11,6 +11,7 @@ uncertainty. Ask for review instead of inventing a value."
 from __future__ import annotations
 
 from ..profiles.bambu_settings import is_verified
+from ..profiles.bambu_values import to_typed
 from ..schemas import AnalysisResult, OptimizationResult, PrintContext, PrintGoal
 from . import rules
 
@@ -37,21 +38,58 @@ def _maybe(change) -> list:
 
 def _uncertainties(analysis: AnalysisResult, ctx: PrintContext, changes: list) -> list[str]:
     notes: list[str] = []
+    oh, br, tw = analysis.overhangs, analysis.bridges, analysis.thin_walls
+    need = rules.support_need(analysis)
+    current = {k: to_typed(k, v) for k, v in ctx.current_settings.items()}
 
-    if analysis.bridges.bridge_face_count > 0:
+    if need == rules.SUPPORT_SMALL_ONLY:
+        note = (
+            f"{oh.island_count} small overhanging region(s) found (largest "
+            f"{oh.largest_island_area_mm2:.0f} mm^2, {oh.overhang_area_mm2:.0f} mm^2 in total"
+            + (
+                f", flat spans up to {br.longest_span_mm:.0f} mm"
+                if br.bridge_face_count
+                else ""
+            )
+            + "). Regions this size normally print without support, so none is recommended"
+        )
+        if current.get("enable_support") is True:
+            note += (
+                "; support is currently ON, which would leave a mark under each of them — "
+                "consider turning it off for this print"
+            )
+        notes.append(note + ". Check the sliced preview if any of them is a visible face.")
+
+    if need == rules.SUPPORT_NEEDED:
+        if current.get("support_on_build_plate_only") is True:
+            notes.append(
+                "'Support on build plate only' is ON. Any overhanging region that sits above "
+                "another part of the model (not above the bare plate) will get no support. "
+                "This tool can't tell which case applies — check the sliced preview."
+            )
+        if not rules._material_family(ctx):
+            notes.append(
+                f"No tested support-gap value for material '{ctx.material}', so the support "
+                "top Z distance was left alone — set it from the filament maker's guidance."
+            )
+        better = _better_orientation(analysis)
+        if better:
+            notes.append(better)
+
+    if tw.checked_samples and tw.thin_sample_count / tw.checked_samples >= 0.05:
         notes.append(
-            f"{analysis.bridges.bridge_face_count} bridge faces detected "
-            f"({analysis.bridges.bridge_area_mm2:.0f} mm^2, longest span "
-            f"~{analysis.bridges.longest_span_mm:.0f} mm). Bridge-specific cooling/speed "
-            "keys weren't in this project's verified setting list, so no automatic change is "
-            "recommended — review bridge cooling/fan settings manually for this model."
+            f"{tw.thin_sample_count} of {tw.checked_samples} sampled surface points are on "
+            f"material thinner than two wall lines (thinnest {tw.min_thickness_mm:.2f} mm). "
+            "That is either tapered edges (chamfers, countersinks — harmless) or genuinely "
+            "thin walls, which this sampling can't tell apart. If the sliced preview shows "
+            "gaps, switch Wall generator to Arachne or turn on Detect thin wall."
         )
 
     if ctx.goal == PrintGoal.VISUAL_QUALITY:
         notes.append(
-            "Seam placement affects visible quality but this project hasn't verified the exact "
-            "Bambu Studio key/values for seam position against the current install — review the "
-            "seam setting manually rather than trusting an unverified key here."
+            "Seam position decides where the seam line shows, and the right choice depends "
+            "on which side of this model faces the viewer — something the geometry alone "
+            "doesn't say. Set 'Seam position' (aligned / back / nearest / random) yourself."
         )
 
     if not analysis.is_watertight:
@@ -78,3 +116,22 @@ def _uncertainties(analysis: AnalysisResult, ctx: PrintContext, changes: list) -
         )
 
     return notes
+
+
+def _better_orientation(analysis: AnalysisResult) -> str | None:
+    """Mentions a resting orientation that would need far less support,
+    if the analyzer found one. A note, never an automatic change: turning
+    a part over also changes which face gets the bed texture and which
+    way the layer lines run."""
+    current_area = analysis.overhangs.overhang_area_mm2
+    if current_area < 200 or not analysis.orientation_candidates:
+        return None
+    best = min(analysis.orientation_candidates, key=lambda c: c.overhang_area_mm2)
+    if best.overhang_area_mm2 > 0.5 * current_area:
+        return None
+    return (
+        f"As oriented, {current_area:.0f} mm^2 overhangs. A different resting face would cut "
+        f"that to {best.overhang_area_mm2:.0f} mm^2 with {best.bed_contact_area_mm2:.0f} mm^2 "
+        f"on the bed: {best.description}. Worth a look before printing with support — but "
+        "it also changes which face shows the bed texture and the direction of the layer lines."
+    )
