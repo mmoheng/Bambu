@@ -306,6 +306,7 @@ const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&
 const base=p=>String(p||"").split(/[\\/]/).pop();
 const colour=c=>{c=String(c||"");if(/^#?[0-9a-f]{6}([0-9a-f]{2})?$/i.test(c)){c=c.replace("#","");return "#"+c.slice(0,6)}return "transparent"};
 const when=t=>{if(!t)return"";const d=new Date(t);return isNaN(d)?esc(t):d.toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})};
+const t1=v=>v==null?"—":(Math.round(v*10)/10).toString();
 const KIND={slice:"Slice",build_multicolour:"Multi-colour build",slice_check:"Slice check"};
 function thumb(rec){const f=rec.output_path||rec.model_path;if(!f)return '<div class="thumb"></div>';
   return `<img class="thumb" loading="lazy" alt="" src="/api/preview?file=${encodeURIComponent(f)}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb'}))">`}
@@ -318,7 +319,7 @@ function renderPrinter(p){
    <div class="sub">${esc(p.print_name||"")}</div>
    <div class="bar"><i style="width:${Math.max(0,Math.min(100,pct))}%"></i></div>
    <div class="sub">${pct}% ${p.current_layer!=null?`· layer ${p.current_layer}/${p.total_layers??"?"}`:""} ${left?"· "+left:""}</div>
-   <div class="kv"><span>Nozzle</span><span>${p.nozzle_temp_c??"—"} °C</span><span>Bed</span><span>${p.bed_temp_c??"—"} °C</span>
+   <div class="kv"><span>Nozzle</span><span>${t1(p.nozzle_temp_c)} °C</span><span>Bed</span><span>${t1(p.bed_temp_c)} °C</span>
    <span>Connection</span><span>${p.connected?"live":"not live"}${p.seconds_since_last_update!=null?` · ${p.seconds_since_last_update}s ago`:""}</span></div>
    ${(p.warnings||[]).map(w=>`<div class="warnline">${esc(w)}</div>`).join("")}
    ${p.message?`<div class="msg" style="margin-top:8px">${esc(p.message)}</div>`:""}`;
