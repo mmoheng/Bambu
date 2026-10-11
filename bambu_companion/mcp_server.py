@@ -491,9 +491,14 @@ def main(make_service: Callable[[], CompanionService] = CompanionService) -> int
     protocol_out = sys.stdout.buffer
     sys.stdout = sys.stderr
     service = make_service()
+    from .dashboard import maybe_start  # local page on 127.0.0.1; see dashboard.py
+
+    dash = maybe_start(service)
     try:
         McpServer(service, sys.stdin.buffer, protocol_out).serve_forever()
     finally:
+        if dash is not None:
+            dash.stop()
         service.close()
     return 0
 

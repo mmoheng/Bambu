@@ -221,6 +221,27 @@ For printer status, save the printer's connection details locally once
 python -m bambu_companion.bridge.printer_setup
 ```
 
+## Dashboard
+
+A web page on your PC that shows what Bambu Companion is doing: the
+printer and AMS live (progress, layer, temperatures, time left, the
+spools loaded), slices and multi-colour builds as Claude runs them —
+with print time, filament per colour and a picture of the model — and
+the recommendation history.
+
+While Claude Desktop is running the connector, it is at
+**http://127.0.0.1:8421/** (bookmark it). Without Claude Desktop,
+double-click `launch_dashboard.pyw` (or `python -m
+bambu_companion.dashboard`): it shows the same page from the activity
+log, and opens your browser.
+
+It is read-only and local: it listens on 127.0.0.1 only, refuses
+requests that don't come from this PC by name, answers GET only (nothing
+on it can slice, change a setting or touch the printer), and only shows
+pictures of files a job was about. To turn it off, set the environment
+variable `BAMBU_COMPANION_DASHBOARD=0`; to use another port, set
+`BAMBU_COMPANION_DASHBOARD_PORT`.
+
 ## Slice check — do this before trusting headless slicing
 
 Headless slicing failed on 2026-09-20 with "Nothing to be sliced". The

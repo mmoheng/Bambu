@@ -107,6 +107,65 @@ def _output_file(path: Any) -> Path:
     return p
 
 
+ACTIVITY_FILE = "activity.jsonl"
+PRINTER_RETRY_S = 30.0
+ACTIVITY_KEEP = 200
+
+
+def _activity_record(task: Mapping[str, Any]) -> dict[str, Any]:
+    """A task as the dashboard shows it: what it was, how it went, and
+    the figures worth seeing (time, filament per slot) — not the full
+    result, which can carry long slicer logs."""
+    info = task.get("info") or {}
+    rec: dict[str, Any] = {
+        "task_id": task.get("task_id"),
+        "kind": task.get("kind"),
+        "label": info.get("label") or task.get("kind"),
+        "state": task.get("state"),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "model_path": info.get("model_path"),
+        "output_path": info.get("output_path"),
+    }
+    if "started" in task:
+        end = task.get("finished", time.monotonic())
+        rec["elapsed_s"] = round(end - task["started"], 1)
+    if task.get("error"):
+        rec["error"] = str(task["error"]).splitlines()[0][:300]
+    result = task.get("result")
+    if isinstance(result, Mapping):
+        if result.get("output_path"):
+            rec["output_path"] = result["output_path"]
+        plates = result.get("plates")
+        if isinstance(plates, list) and plates:
+            rec["plates"] = [
+                {
+                    "plate": p.get("plate"),
+                    "print_time": p.get("print_time"),
+                    "filament_g": p.get("filament_g"),
+                    "layers": p.get("layers"),
+                    "max_z_mm": p.get("max_z_mm"),
+                    "support_used": p.get("support_used"),
+                    "objects": len(p.get("objects") or []),
+                    "filaments": [
+                        {k: f.get(k) for k in ("slot", "type", "color", "used_g")}
+                        for f in (p.get("filaments") or [])
+                    ],
+                }
+                for p in plates if isinstance(p, Mapping)
+            ]
+        for key in ("strategy", "bed_type", "presets", "warning", "orientation_warning",
+                    "filament_slots", "fits_one_plate", "working_strategy", "summary"):
+            if key in result:
+                rec[key] = result[key]
+        if isinstance(result.get("objects"), list):
+            rec["objects"] = [
+                {"name": o.get("name"), "copies": o.get("copies"), "size_mm": o.get("size_mm")}
+                for o in result["objects"] if isinstance(o, Mapping)
+            ]
+    return rec
+
+
 def _wait_seconds(value: Any, default: float) -> float:
     """How long a tool call may block before handing back a running
     task. Checked BEFORE any work starts, and capped so the call returns
@@ -208,6 +267,8 @@ class CompanionService:
         self._reserved_outputs: set[Path] = set()
         self._exe: Path | None = None
         self._lock = threading.Lock()
+        self._activity_lock = threading.Lock()
+        self.dashboard_url: str | None = None
 
     # ------------------------------------------------------------------
     # helpers
@@ -479,6 +540,8 @@ class CompanionService:
 
     def studio_info(self) -> dict[str, Any]:
         info: dict[str, Any] = {"config": load_studio_config()}
+        if getattr(self, "dashboard_url", None):
+            info["dashboard"] = self.dashboard_url
         try:
             info["executable"] = str(self._studio_executable())
         except studio_runner.StudioRunnerError as exc:
@@ -580,13 +643,21 @@ class CompanionService:
     # background tasks (slicing can outlast one tool call)
     # ------------------------------------------------------------------
 
-    def _start_task(self, kind: str, fn: Callable[[], dict[str, Any]], wait_s: float) -> dict[str, Any]:
+    def _start_task(
+        self, kind: str, fn: Callable[[], dict[str, Any]], wait_s: float, info: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Runs `fn` on a worker thread and waits up to `wait_s` for it.
         `wait_s` must already be validated (`_wait_seconds`) — nothing
         may fail between starting the work and returning its task id,
-        or the caller would lose track of a job that is still running."""
+        or the caller would lose track of a job that is still running.
+        `info` (file paths, a label) is what the dashboard shows while
+        the task runs; finished tasks are also appended to the activity
+        log so the dashboard can show them after a restart."""
         task_id = uuid.uuid4().hex[:12]
-        task: dict[str, Any] = {"task_id": task_id, "kind": kind, "state": "running", "started": time.monotonic()}
+        task: dict[str, Any] = {
+            "task_id": task_id, "kind": kind, "state": "running", "started": time.monotonic(),
+            "started_at": now_iso(), "info": dict(info or {}),
+        }  # fmt: skip
 
         def work() -> None:
             try:
@@ -605,6 +676,9 @@ class CompanionService:
             with self._lock:
                 task.update(outcome)
                 task["finished"] = time.monotonic()
+                task["finished_at"] = now_iso()
+                record = _activity_record(task)
+            self._append_activity(record)
 
         thread = threading.Thread(target=work, name=f"companion-{kind}-{task_id}", daemon=True)
         with self._lock:
@@ -811,7 +885,10 @@ class CompanionService:
                 )
             return summary
 
-        return self._start_task("slice", job, wait)
+        return self._start_task(
+            "slice", job, wait,
+            {"label": f"Slice {model.name}", "model_path": str(model), "output_path": str(destination)},
+        )  # fmt: skip
 
     def build_multicolour_project(
         self,
@@ -909,7 +986,11 @@ class CompanionService:
                 summary["warning"] = "These copies probably don't all fit on one 256 mm plate; use fewer copies."
             return summary
 
-        return self._start_task("build_multicolour", job, wait)
+        return self._start_task(
+            "build_multicolour", job, wait,
+            {"label": f"Multi-colour project from {first.name}", "model_path": str(first),
+             "output_path": str(destination)},
+        )  # fmt: skip
 
     def slice_check(self, model_path: str | None = None, wait_s: float | None = None) -> dict[str, Any]:
         """Runs the headless-slicing diagnostic (see bridge/slice_check.py)."""
@@ -928,11 +1009,83 @@ class CompanionService:
                 "report_path": report.get("report_path"),
             }
 
-        return self._start_task("slice_check", job, wait)
+        return self._start_task("slice_check", job, wait, {"label": "Slice check", "model_path": model})
 
     # ------------------------------------------------------------------
     # printer status (read-only)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # activity (what the dashboard shows)
+    # ------------------------------------------------------------------
+
+    @property
+    def activity_path(self) -> Path:
+        return self.data_dir / ACTIVITY_FILE
+
+    def _append_activity(self, record: dict[str, Any]) -> None:
+        """Appends one finished task to the activity log; keeps the file
+        to the last ACTIVITY_KEEP entries. Best effort: a full disk must
+        not turn a finished slice into a failure."""
+        try:
+            with self._activity_lock:
+                path = self.activity_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+                lines.append(json.dumps(record, default=str, ensure_ascii=False))
+                if len(lines) > ACTIVITY_KEEP:
+                    lines = lines[-ACTIVITY_KEEP:]
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                tmp.replace(path)
+        except OSError:
+            pass
+
+    def activity(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Running tasks first, then finished ones newest first — from
+        this process and, after a restart, from the activity log."""
+        with self._lock:
+            live = [_activity_record(t) for t in self._tasks.values()]
+        seen = {r["task_id"] for r in live}
+        logged = []
+        try:
+            for line in self.activity_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("task_id") not in seen:
+                    logged.append(rec)
+        except OSError:
+            pass
+        running = [r for r in live if r["state"] == "running"]
+        done = [r for r in live if r["state"] != "running"] + logged
+        done.sort(key=lambda r: r.get("finished_at") or r.get("started_at") or "", reverse=True)
+        running.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+        return (running + done)[: max(1, int(limit))]
+
+    def printer_snapshot(self) -> dict[str, Any]:
+        """Printer status for the dashboard: never waits for the printer
+        and never raises; 'configured' False when no printer is set up."""
+        cfg = load_printer_config(self._printer_config_path)
+        if not (cfg["host"] and cfg["serial"] and cfg["access_code"]):
+            return {"configured": False}
+        with self._lock:
+            failed = self._printer.get("snapshot_failure")
+            connected = self._printer["client"] is not None
+        if not connected and failed and time.monotonic() - failed[0] < PRINTER_RETRY_S:
+            # The page polls every couple of seconds; don't hammer an
+            # unreachable printer with connection attempts.
+            return {"configured": True, "connected": False, "message": failed[1]}
+        try:
+            status = self.printer_status(wait_s=0)
+        except Exception as exc:  # noqa: BLE001 - a dashboard poll must not crash anything
+            msg = str(exc) if isinstance(exc, ServiceError) else f"{type(exc).__name__}: {exc}"
+            with self._lock:
+                self._printer["snapshot_failure"] = (time.monotonic(), msg)
+            return {"configured": True, "connected": False, "message": msg}
+        status["configured"] = True
+        return status
 
     def printer_status(self, wait_s: float | None = None) -> dict[str, Any]:
         """Latest printer + AMS status. Read-only: the one thing sent
