@@ -191,6 +191,28 @@ def plate_object_ids(path: str | Path) -> dict[int, list[str]]:
     return plates
 
 
+def filament_slots_used(path: str | Path) -> int:
+    """The highest filament slot (1-based) any object or part in the
+    file is assigned to, from `Metadata/model_settings.config`
+    (`<metadata key="extruder" value="2"/>`). 1 when nothing says
+    otherwise — a plain one-colour model."""
+    with _open(path) as zf:
+        part = _find_part(zf, MODEL_SETTINGS_PART)
+        if part is None:
+            return 1
+        try:
+            root = ET.fromstring(zf.read(part))
+        except ET.ParseError:
+            return 1
+    highest = 1
+    for m in root.iter("metadata"):
+        if m.get("key") == "extruder":
+            n = _as_int(m.get("value"))
+            if n and n > highest:
+                highest = n
+    return highest
+
+
 # ---------------------------------------------------------------------------
 # Slice results
 # ---------------------------------------------------------------------------

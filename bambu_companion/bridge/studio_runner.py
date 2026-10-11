@@ -77,6 +77,43 @@ _INSTALL_DIRS = ("Program Files/Bambu Studio", "Bambu Studio", "Program Files (x
 _LOG_TAIL_LINES = 60
 
 
+# The plate names the CLI's --curr-bed-type accepts, plus the names the
+# Bambu Studio window shows for some of them. On 2026-10-09 a PETG slice
+# with no plate given failed with "Filaments are not compatible with the
+# plate type" (return_code -61): the default plate doesn't allow PETG.
+BED_TYPES = ("Cool Plate", "Engineering Plate", "High Temp Plate", "Textured PEI Plate", "Supertack Plate")
+_BED_ALIASES = {
+    "smooth pei plate": "High Temp Plate",
+    "smooth plate": "High Temp Plate",
+    "textured plate": "Textured PEI Plate",
+    "textured pei": "Textured PEI Plate",
+    "cool plate supertack": "Supertack Plate",
+    "bambu cool plate supertack": "Supertack Plate",
+}
+
+
+def normalize_bed_type(name: str) -> str:
+    """The CLI spelling of a plate name, or StudioRunnerError."""
+    if not isinstance(name, str) or not name.strip():
+        raise StudioRunnerError("bed_type must be a plate name, e.g. 'Textured PEI Plate'.")
+    key = " ".join(name.split()).lower()
+    for known in BED_TYPES:
+        if key == known.lower():
+            return known
+    if key in _BED_ALIASES:
+        return _BED_ALIASES[key]
+    raise StudioRunnerError(
+        f"Unknown plate {name!r}. Use one of: {', '.join(BED_TYPES)} (Smooth PEI = High Temp Plate)."
+    )
+
+
+def _check_colour(value: str) -> str:
+    v = value.strip() if isinstance(value, str) else ""
+    if len(v) == 7 and v[0] == "#" and all(c in string.hexdigits for c in v[1:]):
+        return v.upper()
+    raise StudioRunnerError(f"Colour {value!r} must look like #RRGGBB, e.g. #FFFFFF.")
+
+
 class StudioRunnerError(RuntimeError):
     """Any failure locating, launching, or verifying the output of Bambu
     Studio. Always carries the real underlying message, plus whatever
@@ -394,6 +431,11 @@ def run_slice_job(
 def _studio_error_text(run: Mapping[str, Any]) -> str:
     parts = []
     result = run.get("result_json")
+    if "plate type" in json.dumps(result or {}).lower():
+        parts.append(
+            "Bambu Studio says a filament isn't allowed on the selected plate. Slice again with "
+            "bed_type set to the plate you print on (e.g. 'Textured PEI Plate' for PETG)."
+        )
     if result:
         parts.append(f"result.json: {json.dumps(result)[:600]}")
     for stream in ("stderr_tail", "stdout_tail"):
@@ -499,6 +541,7 @@ def slice_project(
     changes: Mapping[str, Any] | None = None,
     executable_path: str | os.PathLike | None = None,
     plate: int = 0,
+    bed_type: str | None = None,
     use_outputdir: bool = True,
     timeout_s: float = 900.0,
     runner: Callable[..., dict[str, Any]] | None = None,
@@ -506,6 +549,7 @@ def slice_project(
     """Slices a Bambu Studio project 3MF using the settings stored in
     it, with `changes` (approved, registry-listed settings) applied to a
     temporary copy first. The project you pass in is never modified.
+    `bed_type` overrides the project's plate only when given.
     """
     project_path, output_path = Path(project_path).resolve(), Path(output_path).resolve()
     typed = _validated(changes)
@@ -525,12 +569,14 @@ def slice_project(
             model_path=job_input,
             output_3mf_path=out_dir / "sliced.3mf",
             plate=plate,
+            bed_type=normalize_bed_type(bed_type) if bed_type else None,
             use_outputdir=use_outputdir,
         )
         result = run_slice_job(
             spec, executable_path=executable_path, expected_settings=typed, timeout_s=timeout_s, runner=runner
         )
         result["strategy"] = STRATEGY_PROJECT
+        result["bed_type"] = spec.bed_type
         return _finish(result, output_path)
 
 
@@ -542,6 +588,7 @@ def write_full_preset_files(
     process: str,
     filaments: Sequence[str],
     changes: Mapping[str, Any] | None = None,
+    filament_colours: Sequence[str | None] | None = None,
 ) -> tuple[Path, Path, list[Path]]:
     """Resolves the named presets to full configs and writes them into
     `directory` as machine.json / process.json / filament_N.json, with
@@ -557,10 +604,19 @@ def write_full_preset_files(
     machine_path.write_text(json.dumps(machine_cfg, indent=2), encoding="utf-8")
     process_path.write_text(json.dumps(process_cfg, indent=2), encoding="utf-8")
 
+    colours = list(filament_colours or [])
+    if len(colours) > len(filaments):
+        raise StudioRunnerError(f"{len(colours)} colours given for {len(filaments)} filament(s).")
     filament_paths = []
     for i, name in enumerate(filaments, start=1):
         path = directory / f"filament_{i}.json"
-        path.write_text(json.dumps(library.load_full("filament", name), indent=2), encoding="utf-8")
+        cfg = library.load_full("filament", name)
+        colour = colours[i - 1] if i <= len(colours) else None
+        if colour:
+            # Shown in the sliced file and used by the send dialog to
+            # match AMS slots; it doesn't change how anything prints.
+            cfg["filament_colour"] = [_check_colour(colour)]
+        path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         filament_paths.append(path)
     return machine_path, process_path, filament_paths
 
@@ -575,6 +631,7 @@ def slice_with_presets(
     filaments: Sequence[str],
     changes: Mapping[str, Any] | None = None,
     bed_type: str | None = None,
+    filament_colours: Sequence[str | None] | None = None,
     executable_path: str | os.PathLike | None = None,
     orient: bool = False,
     arrange: bool = True,
@@ -606,7 +663,8 @@ def slice_with_presets(
     with tempfile.TemporaryDirectory(prefix="bambu_companion_") as tmp:
         work = Path(tmp)
         machine_path, process_path, filament_paths = write_full_preset_files(
-            library, work / "settings", machine=machine, process=process, filaments=filaments, changes=typed
+            library, work / "settings", machine=machine, process=process, filaments=filaments, changes=typed,
+            filament_colours=filament_colours,
         )
         out_dir = work / "out"
         out_dir.mkdir()
@@ -618,7 +676,7 @@ def slice_with_presets(
             filament_settings_paths=filament_paths,
             orient=orient,
             arrange=arrange,
-            bed_type=bed_type,
+            bed_type=normalize_bed_type(bed_type) if bed_type else None,
             use_outputdir=use_outputdir,
         )
         result = run_slice_job(
@@ -626,6 +684,7 @@ def slice_with_presets(
         )
         result["strategy"] = STRATEGY_PRESETS
         result["presets"] = {"machine": machine, "process": process, "filaments": list(filaments)}
+        result["bed_type"] = spec.bed_type
         return _finish(result, output_path)
 
 

@@ -26,6 +26,8 @@ What it will and won't do, per the project's Safety Rules:
 
 from __future__ import annotations
 
+import json
+import tempfile
 import threading
 import time
 import uuid
@@ -41,6 +43,7 @@ from .model_analyzer import analyze, load_mesh
 from .model_analyzer.mesh_io import MeshLoadError
 from .optimizer import optimize, to_dict
 from .profiles import project_3mf
+from .profiles.multicolour_3mf import MulticolourError, build_multicolour_3mf
 from .profiles.bambu_settings import SETTINGS
 from .profiles.bambu_values import SettingValueError, validate
 from .profiles.preset_library import PRESET_TYPES, PresetError, PresetLibrary, discover_roots
@@ -72,6 +75,7 @@ USER_ERRORS = (
     SettingValueError,
     ApprovalError,
     MeshLoadError,
+    MulticolourError,
     studio_runner.StudioRunnerError,
 )
 
@@ -631,15 +635,34 @@ class CompanionService:
         machine: str | None = None,
         process: str | None = None,
         filament: str | None = None,
+        filaments: list[str] | None = None,
+        filament_colours: list[str] | None = None,
+        bed_type: str | None = None,
         wait_s: float | None = None,
     ) -> dict[str, Any]:
         """Slices with Bambu Studio's command line and reports time,
         filament and support use. Produces a new file; sends nothing to
-        the printer."""
+        the printer.
+
+        `filaments` is one preset name per filament slot, for multi-colour
+        files (`filament` is the one-slot shorthand). `bed_type` is the
+        plate; preset slices always get one (the configured default when
+        not given), because without it PETG was refused outright."""
         wait = _wait_seconds(wait_s, 40.0)
         for label, name in (("machine", machine), ("process", process), ("filament", filament)):
             if name is not None and not isinstance(name, str):
                 raise ServiceError(f"{label} must be a preset name.")
+        if filaments is not None:
+            if (not isinstance(filaments, list) or not filaments
+                    or not all(isinstance(f, str) and f.strip() for f in filaments)):
+                raise ServiceError("filaments must be a list of filament preset names, one per slot.")
+            if filament:
+                raise ServiceError("Give either filament or filaments, not both.")
+        if filament_colours is not None and (
+                not isinstance(filament_colours, list) or not all(isinstance(c, str) for c in filament_colours)):
+            raise ServiceError("filament_colours must be a list like ['#C12E1F', '#FFFFFF'].")
+        if bed_type is not None:
+            bed_type = studio_runner.normalize_bed_type(bed_type)
         typed, proposal = self._resolve_changes(job_id, approved_keys, changes)
         if model_path:
             model = _model_file(model_path)
@@ -653,7 +676,8 @@ class CompanionService:
         confirmed_route, *modifier_list = working.split("+")
         modifiers = set(modifier_list)
         is_project = model.suffix.lower() == ".3mf" and project_3mf.has_project_settings(model)
-        use_presets = bool(machine or process or filament) or not is_project
+        use_presets = bool(machine or process or filament or filaments or filament_colours) or not is_project
+        slots = project_3mf.filament_slots_used(model) if model.suffix.lower() == ".3mf" else 1
         route = studio_runner.STRATEGY_PRESETS if use_presets else studio_runner.STRATEGY_PROJECT
         runner = self._runner
         exe = self._studio_executable()
@@ -667,21 +691,35 @@ class CompanionService:
                 "process": config["default_process"],
                 "filament": config["default_filament"],
             }
+            own_filaments: list[str] = []
             if is_project:
                 # Naming one preset must not silently swap the project's
                 # other two for the defaults: whatever isn't named comes
                 # from the project itself.
                 info = project_3mf.describe_project(model)
-                own_filaments = info.get("filament_presets") or []
+                own_filaments = list(info.get("filament_presets") or [])
                 fallback = {
                     "machine": info.get("printer") or fallback["machine"],
                     "process": info.get("process_preset") or fallback["process"],
                     "filament": own_filaments[0] if own_filaments else fallback["filament"],
                 }
+            if filaments:
+                chosen = [f.strip() for f in filaments]
+            else:
+                # One name (or none): slot 1 gets it; any other slot the
+                # file uses keeps the project's own filament, or the default.
+                chosen = [filament or fallback["filament"]]
+                for i in range(1, max(slots, len(own_filaments))):
+                    chosen.append(own_filaments[i] if i < len(own_filaments) else config["default_filament"])
+            if len(chosen) < slots:
+                raise ServiceError(
+                    f"{model.name} uses {slots} filament slots but {len(chosen)} filament(s) were given. "
+                    "Give one filament preset per slot in filaments."
+                )
             presets = {
                 "machine": machine or fallback["machine"],
                 "process": process or fallback["process"],
-                "filaments": [filament or fallback["filament"]],
+                "filaments": chosen,
             }
 
         # The model's own height, to catch Bambu Studio turning it over.
@@ -695,6 +733,7 @@ class CompanionService:
                     model,
                     destination,
                     changes=typed,
+                    bed_type=bed_type,
                     executable_path=exe,
                     use_outputdir="fullpath" not in modifiers,
                     runner=runner,
@@ -704,7 +743,10 @@ class CompanionService:
                 destination,
                 library=library,
                 changes=typed,
-                bed_type=config["default_bed_type"] if "bed" in modifiers else None,
+                # Always a plate: the default plate refuses PETG (return
+                # code -61), and the user's plate is known.
+                bed_type=bed_type or config.get("default_bed_type") or None,
+                filament_colours=filament_colours,
                 executable_path=exe,
                 orient=False,  # keep the file's orientation (see studio_runner.slice_with_presets)
                 arrange=not is_project,
@@ -728,6 +770,7 @@ class CompanionService:
                 "strategy": result["strategy"],
                 "route_confirmed_by_slice_check": confirmed_route == route,
                 "presets": result.get("presets"),
+                "bed_type": result.get("bed_type") or "as saved in the project",
                 "settings_requested": typed,
                 "settings_verified_in_output": verified,
                 "settings_not_found_in_output": result["unverified_settings"],
@@ -769,6 +812,104 @@ class CompanionService:
             return summary
 
         return self._start_task("slice", job, wait)
+
+    def build_multicolour_project(
+        self,
+        objects: list[Mapping[str, Any]] | None,
+        output_path: str | None = None,
+        *,
+        filaments: list[str] | None = None,
+        filament_colours: list[str] | None = None,
+        bed_type: str | None = None,
+        machine: str | None = None,
+        process: str | None = None,
+        wait_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Combines separate mesh files (e.g. a body and its inlaid
+        numbers, exported in the same coordinates) into one multi-colour
+        Bambu Studio project: each part gets a filament slot, each object
+        a number of copies. Writes a new file next to the first part
+        unless output_path is given; never overwrites.
+
+        The project's settings come from Bambu Studio itself: a 20 mm
+        test cube is sliced with the chosen machine / process / one
+        filament per slot / plate, and the complete config it writes is
+        embedded (the CLI crashes on a multi-part file without one)."""
+        wait = _wait_seconds(wait_s, 40.0)
+        if not isinstance(objects, list) or not objects:
+            raise ServiceError("objects must be a list like [{\"parts\": [{\"path\": ..., \"filament\": 1}]}].")
+        checked, slots = [], 1
+        for i, obj in enumerate(objects, start=1):
+            if not isinstance(obj, Mapping) or not isinstance(obj.get("parts"), list) or not obj["parts"]:
+                raise ServiceError(f"Object {i} needs a non-empty 'parts' list.")
+            parts = []
+            for j, part in enumerate(obj["parts"], start=1):
+                if not isinstance(part, Mapping):
+                    raise ServiceError(f"Object {i}, part {j} must be an object with 'path' and 'filament'.")
+                slot = part.get("filament", 1)
+                if isinstance(slot, bool) or not isinstance(slot, int) or not 1 <= slot <= 16:
+                    raise ServiceError(f"Object {i}, part {j}: filament must be a slot number from 1 to 16.")
+                slots = max(slots, slot)
+                parts.append({**part, "path": str(_model_file(part.get("path"), what=f"object {i} part {j}"))})
+            checked.append({**obj, "parts": parts})
+        for label, name in (("machine", machine), ("process", process)):
+            if name is not None and not isinstance(name, str):
+                raise ServiceError(f"{label} must be a preset name.")
+        if filaments is not None and (
+                not isinstance(filaments, list) or not filaments
+                or not all(isinstance(f, str) and f.strip() for f in filaments)):
+            raise ServiceError("filaments must be a list of filament preset names, one per slot.")
+        if filament_colours is not None and (
+                not isinstance(filament_colours, list) or not all(isinstance(c, str) for c in filament_colours)):
+            raise ServiceError("filament_colours must be a list like ['#C12E1F', '#FFFFFF'].")
+        if bed_type is not None:
+            bed_type = studio_runner.normalize_bed_type(bed_type)
+
+        config = load_studio_config()
+        chosen = [f.strip() for f in filaments] if filaments else [config["default_filament"]] * slots
+        if len(chosen) < slots:
+            raise ServiceError(
+                f"The parts use {slots} filament slots but {len(chosen)} filament(s) were given. "
+                "Give one filament preset per slot in filaments."
+            )
+        machine = machine or config["default_machine"]
+        process = process or config["default_process"]
+        bed = bed_type or config.get("default_bed_type") or None
+        modifiers = set((config.get("working_strategy") or "").split("+")[1:])
+        library = self._preset_library()
+        exe = self._studio_executable()
+        runner = self._runner
+        first = Path(checked[0]["parts"][0]["path"])
+        destination = self._reserve_output(output_path, first.parent, f"{first.stem}_multicolour")
+
+        def job() -> dict[str, Any]:
+            try:
+                with tempfile.TemporaryDirectory(prefix="bambu_companion_mc_") as tmp:
+                    work = Path(tmp)
+                    cube = slice_check.write_test_cube(work / "settings_cube.stl")
+                    ref = studio_runner.slice_with_presets(
+                        cube, work / "settings_cube.3mf", library=library, machine=machine, process=process,
+                        filaments=chosen, filament_colours=filament_colours, bed_type=bed,
+                        executable_path=exe, orient=False, arrange=True,
+                        use_outputdir="fullpath" not in modifiers, runner=runner,
+                    )
+                    settings = project_3mf.read_project_settings(ref["output_path"])
+                summary = build_multicolour_3mf(
+                    checked, destination, project_settings=json.dumps(settings, indent=4)
+                )
+            finally:
+                self._release_output(destination)
+            summary["presets"] = {"machine": machine, "process": process, "filaments": chosen}
+            summary["bed_type"] = bed
+            summary["next_step"] = (
+                "Slice it with slice_model (model_path = this file; it carries its own settings and "
+                "colours), or open it in Bambu Studio. Nothing has been sent to the printer."
+            )
+            if not summary["fits_one_plate"]:
+                summary["warning"] = "These copies probably don't all fit on one 256 mm plate; use fewer copies."
+            return summary
+
+        return self._start_task("build_multicolour", job, wait)
 
     def slice_check(self, model_path: str | None = None, wait_s: float | None = None) -> dict[str, Any]:
         """Runs the headless-slicing diagnostic (see bridge/slice_check.py)."""

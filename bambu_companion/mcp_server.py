@@ -175,8 +175,67 @@ TOOLS: list[dict[str, Any]] = [
             "machine": {"type": "string", "description": "Machine preset name (see list_presets)."},
             "process": {"type": "string", "description": "Process preset name (see list_presets)."},
             "filament": {"type": "string", "description": "Filament preset name (see list_presets)."},
+            "filaments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Multi-colour: one filament preset name per slot, in slot order (instead of filament).",
+            },
+            "filament_colours": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional colour per slot as #RRGGBB, so the send dialog can match AMS spools.",
+            },
+            "bed_type": {
+                "type": "string",
+                "description": "Plate: Textured PEI Plate, Cool Plate, Engineering Plate, High Temp Plate "
+                "(Smooth PEI) or Supertack Plate. Defaults to the plate in studio_info.",
+            },
             "wait_s": _WAIT,
         },
+    ),
+    _tool(
+        "build_multicolour_project",
+        "Combine separate mesh files into one multi-colour Bambu Studio project: each part (e.g. "
+        "a body and its inlaid text, exported in the same coordinates) gets a filament slot, each "
+        "object a number of copies laid out on the plate. Settings come from the named presets "
+        "(one filament per slot, optional colours and plate). Writes a new file (never "
+        "overwrites); then slice it with slice_model. Sends nothing to the printer. May return a "
+        "running task — poll task_status.",
+        {
+            "objects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "copies": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "parts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string", "description": "Full path of an .stl or .3mf on this PC."},
+                                    "filament": {"type": "integer", "minimum": 1, "maximum": 16},
+                                    "name": {"type": "string"},
+                                },
+                                "required": ["path", "filament"],
+                            },
+                        },
+                    },
+                    "required": ["parts"],
+                },
+            },
+            "output_path": {"type": "string", "description": "Optional full path ending in .3mf."},
+            "filaments": {"type": "array", "items": {"type": "string"},
+                          "description": "One filament preset per slot, in slot order (default: the default filament)."},
+            "filament_colours": {"type": "array", "items": {"type": "string"},
+                                 "description": "Optional colour per slot as #RRGGBB."},
+            "bed_type": {"type": "string", "description": "Plate; defaults to the plate in studio_info."},
+            "machine": {"type": "string", "description": "Machine preset name (default from studio_info)."},
+            "process": {"type": "string", "description": "Process preset name (default from studio_info)."},
+            "wait_s": _WAIT,
+        },
+        ["objects"],
     ),
     _tool(
         "slice_check",
@@ -269,6 +328,20 @@ def _dispatch(service: CompanionService, name: str, a: dict[str, Any]) -> Any:
             machine=a.get("machine"),
             process=a.get("process"),
             filament=a.get("filament"),
+            filaments=a.get("filaments"),
+            filament_colours=a.get("filament_colours"),
+            bed_type=a.get("bed_type"),
+            wait_s=a.get("wait_s"),
+        )
+    if name == "build_multicolour_project":
+        return service.build_multicolour_project(
+            a.get("objects"),
+            a.get("output_path"),
+            filaments=a.get("filaments"),
+            filament_colours=a.get("filament_colours"),
+            bed_type=a.get("bed_type"),
+            machine=a.get("machine"),
+            process=a.get("process"),
             wait_s=a.get("wait_s"),
         )
     if name == "slice_check":

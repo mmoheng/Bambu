@@ -286,7 +286,10 @@ class FakeStudio:
         if not self.ignore_settings:
             if model.suffix.lower() == ".3mf":
                 with zipfile.ZipFile(model) as zf:
-                    settings = json.loads(zf.read("Metadata/project_settings.config"))
+                    # A geometry-only 3MF (no project settings) slices
+                    # with whatever presets were loaded, like an STL.
+                    if "Metadata/project_settings.config" in zf.namelist():
+                        settings = json.loads(zf.read("Metadata/project_settings.config"))
             for f in (value("--load-settings") or "").split(";"):
                 if f:
                     settings.update(json.loads(Path(f).read_text(encoding="utf-8")))

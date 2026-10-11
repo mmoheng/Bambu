@@ -149,7 +149,8 @@ A few quality-of-life details worth knowing:
 `bambu_companion/mcp_server.py` lets Claude (the desktop app) use this
 project directly on your PC: analyze a model, read the settings in a
 project file, recommend changes, write a new project file with the
-changes you approved, slice, and read printer/AMS status. Claude
+changes you approved, slice, build multi-colour files, and read
+printer/AMS status. Claude
 Desktop starts it and talks to it over stdin/stdout — no network port,
 no tunnel, no API key, and nothing extra to `pip install` (printer
 status alone needs `paho-mqtt`, as before).
@@ -162,6 +163,24 @@ free name is used); or handle the printer's address, serial or access
 code (no tool takes them, and results and error messages are built
 without them). Preset names given to a tool are looked up by name and
 can't be used as file paths.
+
+Multi-colour: export a part as separate meshes in the same coordinates
+(say a body and its inlaid numbers), then `build_multicolour_project`
+combines them into one Bambu Studio project with a filament slot per
+part and as many copies as you ask for. Give one filament preset per
+slot in `filaments`, and optionally `filament_colours` (`#RRGGBB`, so the
+send dialog matches your AMS spools) and `bed_type`. The project's
+settings are the ones Bambu Studio itself writes for those presets: it
+slices a 20 mm test cube first and embeds that config, because the
+command line crashed on a multi-part file without a complete one. Then
+`slice_model` slices the project with its own settings, or open it in
+Bambu Studio.
+
+Plate: `slice_model` always tells Bambu Studio which plate you print on
+(`default_bed_type` from `studio_info`, normally Textured PEI Plate;
+override with `bed_type`). Without it, a PETG slice was refused with
+"Filaments are not compatible with the plate type". A project 3MF keeps
+its own plate unless you give `bed_type`.
 
 Known limits: if Claude Desktop is closed while a slice is running, the
 Bambu Studio process is left to finish on its own; multi-plate projects
@@ -188,7 +207,7 @@ Set it up once:
 
    If `python` isn't on your PATH, use `"command": "py"`.
 3. Quit Claude Desktop completely and start it again. `bambu-companion`
-   should appear under connectors with 13 tools.
+   should appear under connectors with 14 tools.
 
 If it doesn't show up, the connector's own output is in
 `%APPDATA%\Claude\logs\mcp-server-bambu-companion.log`. You can also
